@@ -22,7 +22,7 @@
 )[
   *Abstract.* The page view is not a picture of the document; it *is* the document.
   Typst lays the file out into pages, and those pages are what you read, click and
-  export. There is no separate compile step and no second renderer.
+  export. There is no separate compile step and no second renderer. this is something that I addded just now.
 ]
 
 = Why a page editor

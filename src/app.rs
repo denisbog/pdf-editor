@@ -15,6 +15,7 @@ use crate::editor::{self, Editor};
 use crate::engine::{self, Compiler, Diagnostic, Event, PageMeta, RasterPool, Task};
 use crate::icons;
 use crate::theme::{self, ThemeKind, ThemePreference, Tokens};
+use crate::vim;
 use crate::widgets;
 
 const PAGE_GAP: f32 = 20.0;
@@ -98,14 +99,25 @@ pub struct Settings {
     pub zoom: f32,
     pub theme: ThemePreference,
     pub view: View,
+    /// Modal (Vim) editing in the source pane.
+    pub vim: bool,
     pub session: Vec<SessionDoc>,
     pub session_active: usize,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { zoom: 1.0, theme: ThemePreference::Light, view: View::Split, session: Vec::new(), session_active: 0 }
+        Self { zoom: 1.0, theme: ThemePreference::Light, view: View::Split, vim: true, session: Vec::new(), session_active: 0 }
     }
+}
+
+/// A document command raised inside a pass, when `self.docs` is out of the window.
+enum PendingAction {
+    Save(u64),
+    Export(u64),
+    Compile(u64),
+    Close(u64),
+    Open(PathBuf),
 }
 
 /// One page's raster as a GPU texture, at `scale` device pixels per point.
@@ -214,6 +226,7 @@ enum Cmd {
     FitWidth,
     Panel(RightPanel),
     Theme(ThemePreference),
+    ToggleVim,
     Shortcuts,
 }
 
@@ -266,9 +279,9 @@ pub struct App {
     wanted: Vec<Task>,
     /// Fonts still scanning: the first compile waits for them.
     fonts_pending: bool,
-    /// Whether the pointer was over the source pane last frame: the editor keeps the paging
-    /// keys there, and the page view keeps them everywhere else.
-    source_hover: bool,
+    /// Document commands raised while the document list was borrowed for a pass (the trail
+    /// buttons, the Compile button, the Vim command line), applied once it is back.
+    pending_actions: Vec<PendingAction>,
 }
 
 impl App {
@@ -305,7 +318,7 @@ impl App {
             pending_zoom: None,
             wanted: Vec::new(),
             fonts_pending: !engine::fonts_ready(),
-            source_hover: false,
+            pending_actions: Vec::new(),
         };
         app.view = app.settings.view;
         if app.fonts_pending {
@@ -637,6 +650,11 @@ impl App {
             Cmd::FitWidth => self.fit_width = true,
             Cmd::Panel(panel) => self.right = if self.right == Some(panel) { None } else { Some(panel) },
             Cmd::Theme(preference) => self.settings.theme = preference,
+            Cmd::ToggleVim => {
+                self.settings.vim = !self.settings.vim;
+                let state = if self.settings.vim { "on" } else { "off" };
+                self.toast(format!("Vim bindings {state}"));
+            }
             Cmd::Shortcuts => self.shortcuts = true,
         }
     }
@@ -663,11 +681,12 @@ impl App {
             Command { label: "Light gray theme", detail: "Theme", icon: "sun", cmd: Cmd::Theme(ThemePreference::Light) },
             Command { label: "Dark gray theme", detail: "Theme", icon: "moon", cmd: Cmd::Theme(ThemePreference::Dark) },
             Command { label: "Use system theme", detail: "Theme", icon: "settings", cmd: Cmd::Theme(ThemePreference::System) },
+            Command { label: if self.settings.vim { "Vim bindings: on" } else { "Vim bindings: off" }, detail: "Editing", icon: "code", cmd: Cmd::ToggleVim },
             Command { label: "Keyboard shortcuts", detail: "Help", icon: "circle-help", cmd: Cmd::Shortcuts },
         ];
         if self.active.is_none() {
             commands.retain(|command| {
-                matches!(command.cmd, Cmd::New | Cmd::Open | Cmd::Theme(_) | Cmd::Shortcuts)
+                matches!(command.cmd, Cmd::New | Cmd::Open | Cmd::Theme(_) | Cmd::ToggleVim | Cmd::Shortcuts)
             });
         }
         commands
@@ -840,6 +859,11 @@ impl App {
                 ui.close();
             }
             ui.separator();
+            let vim = if self.settings.vim { "Vim bindings: on" } else { "Vim bindings: off" };
+            if ui.button(vim).clicked() {
+                self.run_command(Cmd::ToggleVim, ctx);
+                ui.close();
+            }
             if ui.button("Keyboard shortcuts").clicked() {
                 self.shortcuts = true;
                 ui.close();
@@ -894,15 +918,13 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 let save = icons::button(ui, "save", 36.0, false, if dirty { "Save (Ctrl+S) — unsaved changes" } else { "Save (Ctrl+S)" });
                 if save.clicked() {
-                    let ctx = ctx.clone();
-                    self.save(doc.id, false, &ctx);
+                    self.pending_actions.push(PendingAction::Save(doc.id));
                 }
                 if icons::button(ui, "file-output", 36.0, false, "Export PDF (Ctrl+E)").clicked() {
-                    self.export(doc.id);
+                    self.pending_actions.push(PendingAction::Export(doc.id));
                 }
                 if icons::button(ui, "refresh-cw", 36.0, false, "Compile now (Ctrl+R)").clicked() {
-                    let ctx = ctx.clone();
-                    self.recompile(doc.id, &ctx);
+                    self.pending_actions.push(PendingAction::Compile(doc.id));
                 }
                 ui.add_space(2.0);
                 if icons::button(ui, "hand", 36.0, self.pan, "Pan (drag the pages)").clicked() {
@@ -988,14 +1010,24 @@ impl App {
                 self.source_header(ui, doc, ctx);
                 ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, t.divider));
                 ui.add_space(1.0);
-                self.source_hover = ui.rect_contains_pointer(ui.max_rect());
+                doc.editor.vim_bindings = self.settings.vim;
                 egui::Frame::NONE.inner_margin(Margin { left: 6, right: 0, top: 0, bottom: 0 }).show(ui, |ui| {
-                    let response = doc.editor.show(ui, &t);
+                    let output = doc.editor.show(ui, &t);
                     let edge = ui.max_rect().right();
                     ui.painter().vline(edge - 0.5, ui.max_rect().y_range(), Stroke::new(1.0, t.divider));
-                    if response.changed() {
+                    if output.changed {
                         let now = ui.input(|input| input.time);
                         doc.edited_at = Some(now);
+                    }
+                    if let Some(request) = output.request {
+                        // The document list is out of the window for this pass, so the command
+                        // waits until the pass is over.
+                        self.pending_actions.push(match request {
+                            vim::Request::Save => PendingAction::Save(doc.id),
+                            vim::Request::Close => PendingAction::Close(doc.id),
+                            vim::Request::Open(path) => PendingAction::Open(PathBuf::from(path)),
+                            vim::Request::Compile => PendingAction::Compile(doc.id),
+                        });
                     }
                 });
             });
@@ -1012,14 +1044,31 @@ impl App {
                 if dirty {
                     ui.label(RichText::new("●").font(theme::regular(9.0)).color(t.accent));
                 }
+                if self.settings.vim {
+                    let mode = doc.editor.mode_label();
+                    let color = if mode.starts_with("INSERT") {
+                        Color32::from_rgb(0x1E, 0x7D, 0x52)
+                    } else if mode.starts_with("VISUAL") {
+                        Color32::from_rgb(0xC0, 0x5A, 0x1B)
+                    } else if mode.starts_with("COMMAND") {
+                        t.accent_text
+                    } else {
+                        t.text_muted
+                    };
+                    let (rect, _) = ui.allocate_exact_size(vec2(15.0 + mode.chars().count() as f32 * 7.0, 20.0), Sense::hover());
+                    ui.painter().rect_filled(rect, CornerRadius::same(4), color.gamma_multiply(0.12));
+                    ui.painter().text(rect.center(), Align2::CENTER_CENTER, &mode, theme::semibold(10.5), color);
+                }
                 ui.label(RichText::new(format!("line {} of {}", doc.editor.cursor_line + 1, doc.editor.line_count())).font(theme::regular(11.0)).color(t.text_faint));
+                if !doc.editor.vim.message.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(&doc.editor.vim.message).font(theme::regular(11.0)).color(t.text_muted)).truncate());
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(10.0);
                     let (label, color) = status_of(doc, self.fonts_pending);
                     ui.label(RichText::new(label).font(theme::medium(11.5)).color(color));
                     if ui.add(egui::Button::new(RichText::new("Compile").font(theme::medium(11.5))).corner_radius(CornerRadius::same(6))).clicked() {
-                        let ctx = ctx.clone();
-                        self.recompile(doc.id, &ctx);
+                        self.pending_actions.push(PendingAction::Compile(doc.id));
                     }
                 });
             });
@@ -1493,8 +1542,7 @@ impl eframe::App for App {
                 self.recompile(id, &ctx);
             }
         }
-        let editor_owns_keys = ctx.text_edit_focused() && self.source_hover;
-        if !editor_owns_keys {
+        if !ctx.text_edit_focused() {
             if let Some(doc) = self.active.and_then(|id| self.docs.iter_mut().find(|doc| doc.id == id)) {
                 if ctx.input(|input| input.key_pressed(egui::Key::PageDown)) {
                     doc.step_page(true);
@@ -1511,7 +1559,6 @@ impl eframe::App for App {
             }
         }
 
-        self.source_hover = false;
         self.tab_strip(ui, &ctx);
         self.mode_bar(ui, &ctx);
         let mut docs = std::mem::take(&mut self.docs);
@@ -1557,6 +1604,15 @@ impl eframe::App for App {
         }
         docs.append(&mut self.docs);
         self.docs = docs;
+        for action in std::mem::take(&mut self.pending_actions) {
+            match action {
+                PendingAction::Save(id) => self.save(id, false, &ctx),
+                PendingAction::Export(id) => self.export(id),
+                PendingAction::Compile(id) => self.recompile(id, &ctx),
+                PendingAction::Close(id) => self.request_close(id),
+                PendingAction::Open(path) => self.pending_open = Some(path),
+            }
+        }
         self.palette(&ctx);
         self.shortcuts_window(&ctx);
         self.close_confirm(&ctx);

@@ -14,6 +14,7 @@ mod editor;
 mod engine;
 mod icons;
 mod theme;
+mod vim;
 mod widgets;
 
 fn main() -> eframe::Result<()> {

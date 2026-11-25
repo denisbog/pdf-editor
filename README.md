@@ -53,6 +53,8 @@ are compiled once and rasterised at whatever zoom the view needs.
   set from, so a click maps page point → glyph → source line. The caret goes there, the line
   is marked in the gutter, and the view switches out of *Preview* so you can see it. Hovering
   a word marks the run a click would jump to.
+* **Vim motions in the source pane.** Normal, Insert and Visual modes with counts, operators,
+  text objects, `u`/`Ctrl+R` and a command line — see below.
 * **Syntax colours from Typst's own parser.** The editor does not pattern-match markup: it
   parses the buffer with `typst::syntax::parse` and colours the leaves (keywords, strings,
   numbers, math, labels, markers), so the highlighting cannot drift from the language.
@@ -70,6 +72,33 @@ are compiled once and rasterised at whatever zoom the view needs.
   block, math, a table with a caption, a cross-reference, a footnote and a code block.
 
 ![PDF Editor: source on the left, the typeset pages on the right](doc/screenshot.png)
+
+## Vim motions
+
+The source pane is modal, like Vim. It starts in **Normal** mode: press `i`, `a`, `o` … to type
+and `Esc` to come back. The mode and any half-typed command are shown next to the file name
+(`NORMAL`, `INSERT`, `VISUAL`, `VISUAL LINE`, `COMMAND`, plus things like `2d` or `ciw`).
+
+| | |
+| --- | --- |
+| Modes | `i I a A o O` insert; `v` character-wise and `V` line-wise Visual; `:` command line; `Esc` (or `Ctrl+[`) back to Normal |
+| Motions | `h j k l`, `w W b B e E`, `0 ^ $`, `gg`/`G`/`{count}G`, `{`/`}` paragraphs, `+`/`-`/`_`, the column motion, `f t F T` with `;` `,` |
+| Counts | before a motion, an operator or an insert command (`3j`, `2dd`, `5x`, `2p`, `3G`) |
+| Operators | `d c y > <`, doubled for whole lines (`dd cc yy >> <<`), with motions (`dw`, `d$`, `dfx`, `d}`) and text objects (`iw aw iW aW`, `i" a"`, `i' a'`, `` i` a` ``, `i( a(`, `i[ a[`, `i{ a{`) |
+| Shortcuts | `x X s S D C Y r ~ J`; `p`/`P` with the unnamed register |
+| Visual | `d c y x s ~ > < J p` on the selection, `o` to swap ends, `v`/`V` to toggle |
+| Search | `/pattern` then `n` / `N` (wraps around) |
+| Command line | `:w` write, `:q` / `:q!` close the tab, `:e <file>` open, `:comp` compile, `:<n>` go to line |
+| Undo | `u` and `Ctrl+R`; one insert session (or one change + its typing) is one step |
+
+Deliberately not implemented, and warned about on the status line when pressed: marks
+(`m`, `'`), macros (`q`), block Visual (`Ctrl+V`), `.` repeat, named registers, `zz`/`zt`/`zb`
+and folding. `Ctrl+D`/`Ctrl+U`/`Ctrl+F`/`Ctrl+B` move the cursor by lines (the view follows)
+rather than scrolling under a still cursor.
+
+The bindings can be switched off from **Menu ▸ Vim bindings** or the command palette
+(*Vim bindings: on/off*); the choice is remembered. With them off the pane is an ordinary text
+editor and the badge disappears.
 
 ## Requirements
 
@@ -138,7 +167,7 @@ bottom. The right rail toggles the panels and holds the theme and help buttons.
 | `Ctrl++` / `Ctrl+−` / `Ctrl+0` / `Ctrl+2` | zoom in / out / 100% / fit to width |
 | `Ctrl` + wheel | zoom around the pointer |
 | click a page | go to the line that set the text |
-| `Page Down` / `Page Up`, `Home` / `End` | next / previous, first / last page |
+| `Page Down` / `Page Up`, `Home` / `End` | next / previous, first / last page (when no text field has the keyboard) |
 
 The page-keys give way to the source editor while the pointer is over it, so `Page Down`
 scrolls text there and turns pages everywhere else.
@@ -149,7 +178,8 @@ scrolls text there and turns pages everywhere else.
 | --- | --- |
 | `src/main.rs` | entry point and the debug CLI |
 | `src/app.rs` | the window: chrome, document tabs, page stack, panels, click-to-source, session, export |
-| `src/editor.rs` | the source editor: buffer, Typst syntax colours, gutter, current line, go-to-line |
+| `src/editor.rs` | the source editor: buffer, Typst syntax colours, gutter, current line, go-to-line, the command line |
+| `src/vim.rs` | the modal layer: modes, motions, operators, text objects, registers, undo, search |
 | `src/engine/world.rs` | the `typst::World`: the buffer as main source, includes from the document's folder, fonts, date |
 | `src/engine/compile.rs` | the compile thread (compile, diagnostics, text index for click-to-source, PDF export) |
 | `src/engine/mod.rs` | the raster pool that turns compiled pages into textures at the requested zoom |
@@ -193,6 +223,9 @@ result as an egui texture. A request whose page left the screen is replaced, not
 * **Raster scale is capped.** At very high zoom the page is stretched from a 3× raster
   instead of being re-rendered per tile, which is cheaper and blurrier than PdfCraft's tiling.
   Pages are also rendered whole, so a poster-sized page at high zoom costs a large texture.
+* **Vim is a subset.** See the table above: no marks, macros, block Visual, `.` repeat or named
+  registers. Undo snapshots copy the whole buffer, so a very large document pays for `u`; the
+  history keeps the last 400 changes.
 * **Text index is per line, not per word.** A click anywhere in a run of glyphs set from one
   source line lands at the start of that line; the caret is not placed at the character.
 * **The session lives in eframe's storage** (`~/.local/share/pdfeditor/app.ron`), together

@@ -1,17 +1,38 @@
 //! The source editor: the Typst text, its syntax colours (from Typst's own parser), line
-//! numbers, and the "go to line" that a click on a rendered page or a diagnostic triggers.
+//! numbers, Vim motions, and the "go to line" a click on a rendered page triggers.
 
 use std::ops::Range;
 use std::sync::Arc;
 
-use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, Rect, Stroke, TextEdit, Ui, pos2, vec2};
+use egui::text::{CCursor, LayoutJob, TextFormat};
+use egui::text_selection::CCursorRange;
+use egui::{Align2, Color32, FontId, Rect, Stroke, TextEdit, Ui, pos2, vec2};
 use typst::syntax::{SyntaxKind, SyntaxNode};
 
 use crate::theme::Tokens;
+use crate::vim::{self, Vim};
 
 /// How long after the last keystroke the document is compiled again.
 pub const DEBOUNCE: f64 = 0.22;
+/// Height of the command line (`:w`, `/pattern`) drawn at the bottom of the pane.
+const PROMPT_HEIGHT: f32 = 26.0;
+
+/// What the editor's own layout looked like last frame, so a cursor move can tell whether it
+/// is already in sight.
+struct ViewGeom {
+    text_top: f32,
+    text_left: f32,
+    clip: Rect,
+    row_h: f32,
+}
+
+/// What one frame of the editor produced.
+pub struct EditorOutput {
+    /// The buffer changed: the modal layer's edits do not go through the `TextEdit`.
+    pub changed: bool,
+    /// A command the command line asked the window for (`:w`, `:q`, `:e`).
+    pub request: Option<vim::Request>,
+}
 
 pub struct Editor {
     pub text: String,
@@ -25,11 +46,29 @@ pub struct Editor {
     coloured: Option<(u64, usize, bool)>,
     /// The editor's monospace size.
     pub size: f32,
+    /// Modal editing for the source pane.
+    pub vim: Vim,
+    pub vim_bindings: bool,
+    /// Whether the source pane holds the keyboard. egui drops focus on an unmodified Escape,
+    /// which Vim needs for leaving Insert mode, so the pane remembers it and takes focus back.
+    vim_active: bool,
+    view: Option<ViewGeom>,
 }
 
 impl Editor {
     pub fn new(text: String) -> Self {
-        Self { text, goto: None, cursor_line: 0, runs: Arc::new(Vec::new()), coloured: None, size: 12.5 }
+        Self {
+            text,
+            goto: None,
+            cursor_line: 0,
+            runs: Arc::new(Vec::new()),
+            coloured: None,
+            size: 12.5,
+            vim: Vim::new(),
+            vim_bindings: true,
+            vim_active: false,
+            view: None,
+        }
     }
 
     /// Ask for the cursor to be put on `line` (0-based) the next time the editor is shown.
@@ -41,28 +80,77 @@ impl Editor {
         self.text.lines().count().max(1)
     }
 
-    /// Show the editor and return its response. `changed` reports an edit of the text.
-    pub fn show(&mut self, ui: &mut Ui, t: &Tokens) -> egui::Response {
-        self.recolour(t);
+    /// The mode indicator: `NORMAL`, `INSERT`, … and any operator being typed.
+    pub fn mode_label(&self) -> String {
+        if self.vim_bindings {
+            self.vim.status()
+        } else {
+            "EDIT".to_string()
+        }
+    }
+
+    /// Show the editor.
+    pub fn show(&mut self, ui: &mut Ui, t: &Tokens) -> EditorOutput {
         let mono = FontId::monospace(self.size);
-        let row_h = ui.fonts_mut(|f| f.row_height(&mono)).max(1.0);
+        // The row height of a laid-out line is what the gutter must line up with; asking the
+        // font for it directly can differ by a rounding step.
+        let probe = ui.fonts_mut(|fonts| fonts.layout_no_wrap("M".to_owned(), mono.clone(), t.text));
+        let row_h = probe.rows.first().map(|row| row.row.height()).unwrap_or(1.0).max(1.0);
         let char_w = ui.fonts_mut(|f| f.glyph_width(&mono, 'M')).max(1.0);
+        let id = ui.make_persistent_id("typst-source");
+        let focused = ui.memory(|memory| memory.has_focus(id));
+        let elsewhere = ui.memory(|memory| memory.focused()).is_some_and(|other| other != id);
+        if focused {
+            self.vim_active = true;
+        } else if elsewhere {
+            // The palette, the page box or a dialog has the keyboard.
+            self.vim_active = false;
+        }
+        let owns = self.vim_bindings && self.vim_active;
+
+        // The modal layer gets the keys first: in Normal mode it takes all of them, in Insert
+        // mode only Escape and the undo keys.
+        let mut request = None;
+        if owns {
+            self.vim.handle(ui, &mut self.text, true);
+            request = self.vim.request.take();
+            if !focused {
+                ui.memory_mut(|memory| memory.request_focus(id));
+            }
+        }
+        self.recolour(t);
+
         let lines = self.line_count();
         let digits = lines.to_string().len().max(2);
         let gutter = digits as f32 * char_w + 26.0;
-        let id = ui.make_persistent_id("typst-source");
 
-        // A jump puts the caret on the line and asks the scroll view to bring it into sight.
         let mut scroll_to = None;
         if let Some(line) = self.goto.take() {
-            let byte = self.line_start(line);
-            let char_index = self.text[..byte].chars().count();
-            let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-            state.cursor.set_char_range(Some(egui::text_selection::CCursorRange::one(egui::text::CCursor::new(char_index))));
-            state.store(ui.ctx(), id);
-            ui.memory_mut(|memory| memory.request_focus(id));
+            if self.vim_bindings {
+                self.vim.set_line(&self.text, line);
+            } else {
+                let byte = self.line_start(line);
+                let index = self.text[..byte].chars().count();
+                let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+                state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(index))));
+                state.store(ui.ctx(), id);
+                ui.memory_mut(|memory| memory.request_focus(id));
+            }
             scroll_to = Some(line);
-            self.cursor_line = line;
+        }
+        // The modal layer's cursor is the truth; make the `TextEdit` show it.
+        if self.vim_bindings {
+            let (primary, secondary) = self.vim.caret(&self.text);
+            let mut range = CCursorRange::one(CCursor::new(byte_to_char(&self.text, primary)));
+            range.primary = CCursor::new(byte_to_char(&self.text, primary));
+            range.secondary = CCursor::new(byte_to_char(&self.text, secondary));
+            let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+            state.cursor.set_char_range(Some(range));
+            state.store(ui.ctx(), id);
+            self.cursor_line = line_of_byte(&self.text, primary);
+            if self.vim.moved {
+                scroll_to = Some(self.cursor_line);
+            }
         }
 
         let runs = self.runs.clone();
@@ -92,14 +180,24 @@ impl Editor {
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
 
+        let prompt: Option<(char, String)> = if self.vim_bindings { self.vim.prompt().map(|(sigil, line)| (sigil, line.to_string())) } else { None };
+        let reserved = if prompt.is_some() { PROMPT_HEIGHT } else { 0.0 };
         let mut scroll = egui::ScrollArea::both().auto_shrink([false, false]).id_salt(("source-scroll", id));
         if let Some(line) = scroll_to {
-            scroll = scroll.vertical_scroll_offset((line as f32 * row_h - 140.0).max(0.0));
+            let column = if self.vim_bindings { char_column(&self.text, line, self.vim.cursor()) } else { 0 };
+            let (vertical, horizontal) = self.scroll_offsets(line, column, row_h, char_w, gutter);
+            if let Some(vertical) = vertical {
+                scroll = scroll.vertical_scroll_offset(vertical);
+            }
+            if let Some(horizontal) = horizontal {
+                scroll = scroll.horizontal_scroll_offset(horizontal);
+            }
         }
+
         let output = scroll.show(ui, |ui| {
             let clip = ui.clip_rect();
             let longest = self.text.lines().map(|line| line.chars().count()).max().unwrap_or(0) as f32;
-            let content = vec2((gutter + longest * char_w + 48.0).max(clip.width()), (lines as f32 * row_h + 28.0).max(clip.height()));
+            let content = vec2((gutter + longest * char_w + 48.0).max(clip.width()), (lines as f32 * row_h + 28.0 + reserved).max(clip.height()));
             let (rect, _) = ui.allocate_exact_size(content, egui::Sense::hover());
             let text_rect = Rect::from_min_size(rect.min + vec2(gutter, 14.0), vec2(content.x - gutter, content.y - 14.0));
 
@@ -126,19 +224,10 @@ impl Editor {
                     .layouter(&mut layouter),
             );
 
-            // Where the caret is now, for the line highlight and for "line n of m" in the bar.
-            if let Some(state) = TextEdit::load_state(ui.ctx(), id) {
-                if let Some(range) = state.cursor.char_range() {
-                    let index = range.primary.index.0.min(self.text.chars().count());
-                    let byte = self.text.char_indices().nth(index).map_or(self.text.len(), |(byte, _)| byte);
-                    self.cursor_line = self.text[..byte].matches('\n').count();
-                }
-            }
-
             // The gutter is painted over the viewport's left edge, so the numbers stay put
             // while the text scrolls sideways.
             let gutter_rect = Rect::from_min_max(pos2(clip.left(), clip.top()), pos2(clip.left() + gutter, clip.bottom()));
-            ui.painter().rect_filled(gutter_rect, 0.0, if matches!(t.kind, crate::theme::ThemeKind::Dark) { t.panel } else { t.panel });
+            ui.painter().rect_filled(gutter_rect, 0.0, t.panel);
             ui.painter().vline(gutter_rect.right() - 0.5, gutter_rect.y_range(), Stroke::new(1.0, t.divider));
             let number_font = FontId::monospace(self.size - 1.5);
             let first = (((clip.top() - text_rect.top()) / row_h).floor() as isize).max(0) as usize;
@@ -146,11 +235,68 @@ impl Editor {
             for line in first..last.min(lines) {
                 let y = text_rect.top() + line as f32 * row_h + row_h * 0.5;
                 let color = if line == self.cursor_line { t.accent_text } else { t.text_faint.gamma_multiply(0.85) };
-                ui.painter().text(pos2(gutter_rect.right() - 8.0, y), egui::Align2::RIGHT_CENTER, (line + 1).to_string(), number_font.clone(), color);
+                ui.painter().text(pos2(gutter_rect.right() - 8.0, y), Align2::RIGHT_CENTER, (line + 1).to_string(), number_font.clone(), color);
             }
+            self.view = Some(ViewGeom { text_top: text_rect.top(), text_left: text_rect.left(), clip, row_h });
             response
         });
-        output.inner
+
+        // Pull the caret back out: in Insert mode the TextEdit moved it, and the mouse can
+        // click or select anywhere.
+        if self.vim_bindings {
+            if let Some(state) = TextEdit::load_state(ui.ctx(), id) {
+                if let Some(range) = state.cursor.char_range() {
+                    let primary = char_to_byte(&self.text, range.primary.index.0);
+                    let secondary = char_to_byte(&self.text, range.secondary.index.0);
+                    self.vim.sync(&self.text, primary, secondary);
+                }
+            }
+            self.cursor_line = line_of_byte(&self.text, self.vim.cursor());
+        } else if let Some(state) = TextEdit::load_state(ui.ctx(), id) {
+            if let Some(range) = state.cursor.char_range() {
+                let index = range.primary.index.0.min(self.text.chars().count());
+                let byte = self.text.char_indices().nth(index).map_or(self.text.len(), |(byte, _)| byte);
+                self.cursor_line = self.text[..byte].matches('\n').count();
+            }
+        }
+
+        if let Some((sigil, line)) = &prompt {
+            self.prompt_bar(ui, t, &mono, *sigil, line);
+        }
+
+        // Edits the modal layer made do not go through the `TextEdit`, so its `changed` flag
+        // has to be joined with ours.
+        EditorOutput { changed: output.inner.changed() || (self.vim_bindings && self.vim.changed), request }
+    }
+
+    /// Where the view must scroll to so the cursor is in sight. `None` when the line (or the
+    /// character) is already visible, so a one-line motion does not move the view.
+    fn scroll_offsets(&self, line: usize, column: usize, row_h: f32, char_w: f32, gutter: f32) -> (Option<f32>, Option<f32>) {
+        let Some(view) = &self.view else {
+            return (Some((line as f32 * row_h - row_h * 8.0).max(0.0)), None);
+        };
+        let y = view.text_top + line as f32 * view.row_h;
+        let vertical_visible = y >= view.clip.top() && y + view.row_h <= view.clip.bottom();
+        let vertical = (!vertical_visible).then(|| (line as f32 * row_h - view.clip.height() * 0.35).max(0.0));
+        let x = view.text_left + column as f32 * char_w;
+        let band = view.clip.width() - gutter;
+        let horizontal_visible = x >= view.clip.left() + gutter + 4.0 && x <= view.clip.right() - 24.0;
+        let horizontal = (!horizontal_visible).then(|| (column as f32 * char_w - band * 0.25).max(0.0));
+        (vertical, horizontal)
+    }
+
+    fn prompt_bar(&self, ui: &Ui, t: &Tokens, mono: &FontId, sigil: char, line: &str) {
+        let area = ui.max_rect();
+        let bar = Rect::from_min_max(pos2(area.left(), area.bottom() - PROMPT_HEIGHT), area.right_bottom());
+        ui.painter().rect_filled(bar, 0.0, t.field);
+        ui.painter().hline(bar.x_range(), bar.top(), Stroke::new(1.0, t.divider));
+        let text = format!("{sigil}{line}");
+        let left = bar.left_center() + vec2(10.0, 0.0);
+        let galley = ui.painter().layout_no_wrap(text, mono.clone(), t.text);
+        let size = galley.size();
+        ui.painter().galley(left - vec2(0.0, size.y * 0.5), galley, t.text);
+        let caret = Rect::from_min_size(pos2(left.x + size.x + 1.0, left.y - size.y * 0.5 + 1.0), vec2(1.5, size.y - 2.0));
+        ui.painter().rect_filled(caret, 0.0, t.text);
     }
 
     /// Byte offset of the start of `line` (0-based), clamped to the text's end.
@@ -170,10 +316,33 @@ impl Editor {
         let root = typst::syntax::parse(&self.text);
         let mut runs = Vec::new();
         collect(&root, 0, &palette, &mut runs);
-        // Any byte the tree does not cover (it should cover everything) keeps the plain colour.
         self.runs = Arc::new(runs);
         self.coloured = Some((hash, self.text.len(), t.dark()));
     }
+}
+
+fn byte_to_char(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())].chars().count()
+}
+
+fn char_to_byte(text: &str, index: usize) -> usize {
+    text.char_indices().nth(index).map_or(text.len(), |(byte, _)| byte)
+}
+
+fn line_of_byte(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())].matches('\n').count()
+}
+
+/// The cursor's column in characters, when it sits on `line`.
+fn char_column(text: &str, line: usize, byte: usize) -> usize {
+    let mut start = 0;
+    for _ in 0..line {
+        match text[start..].find('\n') {
+            Some(offset) => start += offset + 1,
+            None => return 0,
+        }
+    }
+    text[start..byte.min(text.len())].chars().count()
 }
 
 fn append(job: &mut LayoutJob, mono: &FontId, text: &str, start: usize, end: usize, color: Color32) {
@@ -282,10 +451,6 @@ impl Palette {
                 let name = kind.name();
                 if name.ends_with("Paren") || name.ends_with("Brace") || name.ends_with("Bracket") {
                     self.marker
-                } else if matches!(kind, SyntaxKind::Text) {
-                    self.text
-                } else if kind == SyntaxKind::FuncCall || kind == SyntaxKind::Args || kind == SyntaxKind::Named {
-                    self.text
                 } else {
                     self.text
                 }
@@ -293,4 +458,3 @@ impl Palette {
         }
     }
 }
-
