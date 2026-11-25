@@ -58,6 +58,11 @@ are compiled once and rasterised at whatever zoom the view needs.
   a word marks the run a click would jump to.
 * **Vim motions in the source pane.** Normal, Insert and Visual modes with counts, operators,
   text objects, `u`/`Ctrl+R` and a command line — see below.
+* **Soft wrap and a split you set.** Long lines wrap at the pane's width (one line number per
+  logical line, on its first row; the current-line band and diagnostic squiggles follow the
+  wrapped rows). The divider between the source and the pages is draggable, as is the edge of
+  the Problems/Document/Log panel, and both widths are remembered. With *Fit to width* the
+  pages re-fit as the band changes, until you pick a zoom yourself.
 * **Syntax colours from Typst's own parser.** The editor does not pattern-match markup: it
   parses the buffer with `typst::syntax::parse` and colours the leaves (keywords, strings,
   numbers, math, labels, markers), so the highlighting cannot drift from the language.
@@ -224,8 +229,8 @@ result as an egui texture. A request whose page left the screen is replaced, not
 * **One file per tab is the main source.** An included file can be read and typeset, but
   editing it means opening it in its own tab (and its edits are not noticed by the including
   document until it is compiled again).
-* **No soft wrap in the source.** Long lines scroll horizontally, so a line number always
-  means one screen row. `Tab` indents inside the source instead of moving focus.
+* **`Tab` indents inside the source** instead of moving focus; there is no block indent
+  selection beyond Vim's `>`/`<`.
 * **Raster scale is capped.** At very high zoom the page is stretched from a 3× raster
   instead of being re-rendered per tile, which is cheaper and blurrier than PdfCraft's tiling.
   Pages are also rendered whole, so a poster-sized page at high zoom costs a large texture.

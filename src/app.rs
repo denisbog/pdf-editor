@@ -27,8 +27,14 @@ const ZOOM_MAX: f32 = 6.0;
 const ZOOM_STEPS: [f32; 17] = [0.1, 0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0];
 /// Space above the first page and below the last, for the drop shadow.
 const SCROLL_MARGIN: f32 = 22.0;
-/// Width of a right-hand panel (Problems, Document, Log).
+/// Width of a right-hand panel (Problems, Document, Log), and the range a drag can give it.
 const SIDE_WIDTH: f32 = 312.0;
+const SIDE_MIN: f32 = 240.0;
+const SIDE_MAX: f32 = 640.0;
+/// The narrowest either side of the source/pages split may become, and the width of the grip
+/// gap that the dividers live in (so neither side's scroll area covers them).
+const SOURCE_MIN: f32 = 240.0;
+const GRIP: f32 = 3.0;
 
 const WELCOME: &str = r#"#set page(paper: "a4", margin: (x: 2.4cm, y: 2.5cm))
 #set text(font: "Libertinus Serif", size: 11pt)
@@ -101,13 +107,24 @@ pub struct Settings {
     pub view: View,
     /// Modal (Vim) editing in the source pane.
     pub vim: bool,
+    /// Keep the pages fitted to the band as it changes (until a zoom is chosen).
+    #[serde(default = "default_fit")]
+    pub fit_width: bool,
+    /// The source pane's share of the band in Split view (0.2..=0.8).
+    pub split: f32,
+    /// The width of the Problems/Document/Log panel, in points.
+    pub side_width: f32,
     pub session: Vec<SessionDoc>,
     pub session_active: usize,
 }
 
+fn default_fit() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
-        Self { zoom: 1.0, theme: ThemePreference::Light, view: View::Split, vim: true, session: Vec::new(), session_active: 0 }
+        Self { zoom: 1.0, theme: ThemePreference::Light, view: View::Split, vim: true, fit_width: true, split: 0.44, side_width: SIDE_WIDTH, session: Vec::new(), session_active: 0 }
     }
 }
 
@@ -276,7 +293,6 @@ pub struct App {
     palette_query: String,
     palette_focus: bool,
     shortcuts: bool,
-    fit_width: bool,
     pending_zoom: Option<f32>,
     /// The rasters this frame's page view asks for.
     wanted: Vec<Task>,
@@ -317,7 +333,6 @@ impl App {
             palette_query: String::new(),
             palette_focus: false,
             shortcuts: false,
-            fit_width: true,
             pending_zoom: None,
             wanted: Vec::new(),
             fonts_pending: !engine::fonts_ready(),
@@ -402,7 +417,7 @@ impl App {
                 self.compiler.compile(id, doc.gen, path.clone(), doc.editor.text.clone());
                 self.docs.push(doc);
                 self.active = Some(id);
-                self.fit_width = true;
+                self.settings.fit_width = true;
                 self.pending_zoom = None;
                 self.toast(format!("{name} — compiling"));
                 ctx.request_repaint();
@@ -445,7 +460,7 @@ impl App {
         self.docs.push(doc);
         self.active = Some(id);
         self.view = View::Split;
-        self.fit_width = true;
+        self.settings.fit_width = true;
         ctx.request_repaint();
     }
 
@@ -621,7 +636,7 @@ impl App {
             doc.zoom_anchor = Some(anchor);
         }
         self.settings.zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
-        self.fit_width = false;
+        self.settings.fit_width = false;
     }
 
     // ------------------------------------------------------------------ commands
@@ -660,7 +675,7 @@ impl App {
             Cmd::ZoomIn => self.zoom_step(true),
             Cmd::ZoomOut => self.zoom_step(false),
             Cmd::Zoom100 => self.pending_zoom = Some(1.0),
-            Cmd::FitWidth => self.fit_width = true,
+            Cmd::FitWidth => self.settings.fit_width = true,
             Cmd::Panel(panel) => self.right = if self.right == Some(panel) { None } else { Some(panel) },
             Cmd::Theme(preference) => self.settings.theme = preference,
             Cmd::ToggleVim => {
@@ -868,7 +883,7 @@ impl App {
                 ui.close();
             }
             if ui.button("Fit to width").clicked() {
-                self.fit_width = true;
+                self.settings.fit_width = true;
                 ui.close();
             }
             ui.separator();
@@ -914,7 +929,7 @@ impl App {
         });
         response.on_hover_text("Zoom — Ctrl + wheel zooms in and out");
         if fit {
-            self.fit_width = true;
+            self.settings.fit_width = true;
         }
         if let Some(step) = chosen {
             self.pending_zoom = Some(step);
@@ -950,7 +965,7 @@ impl App {
                     self.zoom_step(true);
                 }
                 if icons::button(ui, "maximize", 36.0, false, "Fit to width").clicked() {
-                    self.fit_width = true;
+                    self.settings.fit_width = true;
                 }
                 if icons::button(ui, "gauge", 36.0, false, "Actual size (100%)").clicked() {
                     self.pending_zoom = Some(1.0);
@@ -1012,14 +1027,13 @@ impl App {
             });
     }
 
-    fn source_panel(&mut self, ui: &mut egui::Ui, doc: &mut Doc, ctx: &egui::Context) {
+    fn source_body(&mut self, ui: &mut egui::Ui, rect: Rect, doc: &mut Doc, ctx: &egui::Context) {
         let t = Tokens::get(ctx);
-        let width = (ui.available_width() * 0.44).clamp(320.0, 820.0);
-        egui::Panel::left("source_panel")
-            .exact_size(if self.view == View::Source { ui.available_width() } else { width })
-            .resizable(self.view == View::Split)
-            .frame(Frame::NONE.fill(t.panel).inner_margin(Margin { left: 0, right: 0, top: 0, bottom: 0 }))
-            .show(ui, |ui| {
+        ui.painter().rect_filled(rect, 0.0, t.panel);
+        let mut body = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
+        body.set_clip_rect(rect);
+        let ui = &mut body;
+        {
                 self.source_header(ui, doc, ctx);
                 ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0, t.divider));
                 ui.add_space(1.0);
@@ -1044,21 +1058,30 @@ impl App {
                         });
                     }
                 });
-            });
+        }
     }
 
     fn source_header(&mut self, ui: &mut egui::Ui, doc: &mut Doc, ctx: &egui::Context) {
         let t = Tokens::get(ctx);
         let header_rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 38.0));
+        // A narrow pane keeps only what fits: the name and the message shorten, and the mode
+        // badge and compile status drop out, so nothing overlaps when the split is dragged in.
+        let width = header_rect.width();
+        let show_status = width > 380.0;
+        let show_mode = width > 300.0;
+        let reserve = if show_status { 210.0 } else { 84.0 };
+        let badge = if show_mode { 90.0 } else { 0.0 };
+        let name_chars = (((width - reserve - badge - 24.0) / 7.0) as usize).clamp(6, 44);
+        let message_chars = (((width - reserve - 230.0) / 6.0) as usize).clamp(0, 90);
         ui.scope_builder(egui::UiBuilder::new().max_rect(header_rect), |ui| {
             ui.horizontal_centered(|ui| {
                 ui.add_space(12.0);
                 let dirty = doc.dirty();
-                ui.label(RichText::new(doc.name()).font(theme::medium(12.5)).color(t.text));
+                ui.label(RichText::new(shorten(&doc.name(), name_chars)).font(theme::medium(12.5)).color(t.text));
                 if dirty {
                     ui.label(RichText::new("●").font(theme::regular(9.0)).color(t.accent));
                 }
-                if self.settings.vim {
+                if show_mode && self.settings.vim {
                     let mode = doc.editor.mode_label();
                     let color = if mode.starts_with("INSERT") {
                         Color32::from_rgb(0x1E, 0x7D, 0x52)
@@ -1073,21 +1096,23 @@ impl App {
                     ui.painter().rect_filled(rect, CornerRadius::same(4), color.gamma_multiply(0.12));
                     ui.painter().text(rect.center(), Align2::CENTER_CENTER, &mode, theme::semibold(10.5), color);
                 }
-                ui.label(
-                    RichText::new(format!("{}:{} / {}", doc.editor.cursor_line + 1, doc.editor.cursor_column() + 1, doc.editor.line_count()))
-                        .font(theme::regular(11.0))
-                        .color(t.text_faint),
-                );
-                if !doc.editor.vim.message.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(&doc.editor.vim.message).font(theme::regular(11.0)).color(t.text_muted)).truncate());
+                if message_chars > 12 && !doc.editor.vim.message.is_empty() {
+                    ui.label(RichText::new(shorten(&doc.editor.vim.message, message_chars)).font(theme::regular(11.0)).color(t.text_muted));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(10.0);
-                    let (label, color) = status_of(doc, self.fonts_pending);
-                    ui.label(RichText::new(label).font(theme::medium(11.5)).color(color));
-                    if ui.add(egui::Button::new(RichText::new("Compile").font(theme::medium(11.5))).corner_radius(CornerRadius::same(6))).clicked() {
-                        self.pending_actions.push(PendingAction::Compile(doc.id));
+                    if show_status {
+                        let (label, color) = status_of(doc, self.fonts_pending);
+                        ui.label(RichText::new(label).font(theme::medium(11.5)).color(color));
+                        if ui.add(egui::Button::new(RichText::new("Compile").font(theme::medium(11.5))).corner_radius(CornerRadius::same(6))).clicked() {
+                            self.pending_actions.push(PendingAction::Compile(doc.id));
+                        }
                     }
+                    ui.label(
+                        RichText::new(format!("{}:{} / {}", doc.editor.cursor_line + 1, doc.editor.cursor_column() + 1, doc.editor.line_count()))
+                            .font(theme::regular(11.0))
+                            .color(t.text_faint),
+                    );
                 });
             });
         });
@@ -1139,16 +1164,19 @@ impl App {
         }
         self.zoom_input(ui, viewport, doc);
         // Fit to width waits for the first compile: there is no page size to fit yet.
-        if self.fit_width && !doc.metas.is_empty() {
+        if self.settings.fit_width && !doc.metas.is_empty() {
             let band = viewport.width().max(64.0);
             let widest = doc.metas.iter().map(|page| page.width).fold(1.0_f32, f32::max);
             let spread = (band - 32.0 - SPREAD_GAP) / (2.0 * widest);
-            let zoom = if spread >= FIT_SPREAD_MIN { spread } else { (band - 32.0) / widest };
-            if let Some(anchor) = anchor_under(doc, viewport.center(), viewport.top()) {
-                doc.zoom_anchor = Some(anchor);
+            let zoom = (if spread >= FIT_SPREAD_MIN { spread } else { (band - 32.0) / widest }).clamp(ZOOM_MIN, ZOOM_MAX);
+            // Fit to width stays on while the band changes (a window or split resize), but only
+            // moves the zoom - and with it the view - when the target actually changes.
+            if (zoom - self.settings.zoom).abs() > 0.001 {
+                if let Some(anchor) = anchor_under(doc, viewport.center(), viewport.top()) {
+                    doc.zoom_anchor = Some(anchor);
+                }
+                self.settings.zoom = zoom;
             }
-            self.settings.zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
-            self.fit_width = false;
         }
         let goto_page = doc.goto.take();
         let zoom = self.settings.zoom;
@@ -1565,7 +1593,7 @@ impl eframe::App for App {
             self.pending_zoom = Some(1.0);
         }
         if command && ctx.input(|input| input.key_pressed(egui::Key::Num2)) {
-            self.fit_width = true;
+            self.settings.fit_width = true;
         }
         if ctx.text_edit_focused() && ctx.input(|input| input.key_pressed(egui::Key::Enter) && input.modifiers.command) {
             if let Some(id) = self.active {
@@ -1595,9 +1623,6 @@ impl eframe::App for App {
         if let Some(doc) = docs.iter_mut().find(|doc| Some(doc.id) == self.active) {
             self.left_rail(ui, &ctx, doc);
             self.right_rail(ui, &ctx);
-            if self.view != View::Preview {
-                self.source_panel(ui, doc, &ctx);
-            }
         }
         let t = Tokens::get(&ctx);
         let fill = t.pasteboard;
@@ -1608,10 +1633,23 @@ impl eframe::App for App {
                     // The side panel is drawn inside the central area rather than as a panel of
                     // its own: its width is then exactly what the page view leaves over, and a
                     // narrow panel cannot be squeezed by the page view beside it.
-                    let width = if self.right.is_some() { SIDE_WIDTH.min(band.width() * 0.55) } else { 0.0 };
+                    let width = if self.right.is_some() { self.settings.side_width.clamp(SIDE_MIN, SIDE_MAX).min(band.width() * 0.6) } else { 0.0 };
                     let view = Rect::from_min_max(band.min, egui::pos2(band.max.x - width, band.max.y));
+                    if self.right.is_some() {
+                        // The panel's edge is draggable: pull it left for a wider panel.
+                        let divider = band.max.x - width;
+                        let handle = Rect::from_min_max(egui::pos2(divider - GRIP, band.top()), egui::pos2(divider + GRIP, band.bottom()));
+                        let response = ui.interact(handle, Id::new("side-panel-resize"), Sense::click_and_drag());
+                        if response.hovered() || response.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+                        if response.dragged() {
+                            self.settings.side_width = (width - response.drag_delta().x).clamp(SIDE_MIN, SIDE_MAX);
+                        }
+                    }
                     if let Some(panel) = self.right {
-                        let panel_rect = Rect::from_min_max(egui::pos2(view.max.x, band.min.y), band.max);
+                        ui.painter().vline(band.max.x - width, band.y_range(), Stroke::new(1.0, t.divider));
+                        let panel_rect = Rect::from_min_max(egui::pos2(band.max.x - width + GRIP, band.min.y), band.max);
                         ui.painter().rect_filled(panel_rect, 0.0, t.panel);
                         ui.painter().vline(panel_rect.left() + 0.5, panel_rect.y_range(), Stroke::new(1.0, t.divider));
                         let inner = Rect::from_min_max(panel_rect.min + vec2(12.0, 8.0), panel_rect.max - vec2(10.0, 10.0));
@@ -1623,9 +1661,41 @@ impl eframe::App for App {
                             RightPanel::Log => log_panel(&mut panel_ui, &self.compiler),
                         }
                     }
-                    let mut view_ui = ui.new_child(egui::UiBuilder::new().max_rect(view).layout(Layout::top_down(Align::Min)));
-                    view_ui.set_clip_rect(view);
-                    self.viewer(&mut view_ui, doc, &ctx);
+                    // The band left of the panel: the source pane, the pages, or both with a
+                    // divider the user can drag.
+                    let source_width = match self.view {
+                        View::Preview => 0.0,
+                        View::Source => view.width(),
+                        View::Split => {
+                            let want = (view.width() * self.settings.split).clamp(SOURCE_MIN, (view.width() - SOURCE_MIN).max(SOURCE_MIN));
+                            let divider = view.min.x + want;
+                            let handle = Rect::from_min_max(egui::pos2(divider - GRIP, view.top()), egui::pos2(divider + GRIP, view.bottom()));
+                            let response = ui.interact(handle, Id::new("source-split-resize"), Sense::click_and_drag());
+                            if response.hovered() || response.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                            }
+                            if response.dragged() {
+                                let next = (want + response.drag_delta().x).clamp(SOURCE_MIN, (view.width() - SOURCE_MIN).max(SOURCE_MIN));
+                                self.settings.split = next / view.width().max(1.0);
+                            }
+                            ui.painter().vline(divider, view.y_range(), Stroke::new(1.0, t.divider));
+                            want
+                        }
+                    };
+                    if source_width > 0.0 {
+                        // The grip gap keeps each side's own scroll area off the divider, so a
+                        // drag on it reaches the resize handle and not the text underneath.
+                        let right = (view.min.x + source_width - if self.view == View::Split { GRIP } else { 0.0 }).max(view.min.x);
+                        let source = Rect::from_min_max(view.min, egui::pos2(right, view.max.y));
+                        self.source_body(ui, source, doc, &ctx);
+                    }
+                    if self.view != View::Source {
+                        let left = (view.min.x + source_width + if self.view == View::Split { GRIP } else { 0.0 }).min(view.max.x);
+                        let pages = Rect::from_min_max(egui::pos2(left, view.min.y), view.max);
+                        let mut view_ui = ui.new_child(egui::UiBuilder::new().max_rect(pages).layout(Layout::top_down(Align::Min)));
+                        view_ui.set_clip_rect(pages);
+                        self.viewer(&mut view_ui, doc, &ctx);
+                    }
                 });
             }
             None => {
@@ -1848,6 +1918,16 @@ fn marks_for(text: &str, diagnostics: &[Diagnostic]) -> Vec<editor::Mark> {
     marks
 }
 
+/// Shorten a label to `max` characters, marking the cut with an ellipsis.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut short: String = text.chars().take(max.saturating_sub(1)).collect();
+    short.push('…');
+    short
+}
+
 /// The compile status in the mode bar and the source header.
 fn status_of(doc: &Doc, fonts_pending: bool) -> (String, Color32) {
     let error = Color32::from_rgb(0xC0, 0x39, 0x2B);
@@ -1963,6 +2043,12 @@ mod tests {
 
     fn diagnostic(severity: Severity, range: Option<std::ops::Range<usize>>, line: usize, column: usize) -> Diagnostic {
         Diagnostic { severity, message: String::new(), hints: Vec::new(), line, column, file: None, range }
+    }
+
+    #[test]
+    fn shorten_marks_the_cut() {
+        assert_eq!(shorten("demo.typ", 20), "demo.typ");
+        assert_eq!(shorten("a-very-long-document-name.typ", 10), "a-very-lo…");
     }
 
     #[test]

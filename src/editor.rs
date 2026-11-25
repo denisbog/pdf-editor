@@ -17,14 +17,52 @@ use crate::vim::{self, Vim};
 pub const DEBOUNCE: f64 = 0.6;
 /// Height of the command line (`:w`, `/pattern`) drawn at the bottom of the pane.
 const PROMPT_HEIGHT: f32 = 26.0;
+/// Room above the first line and below the last, so the caret never sits on the edge.
+const PADDING_TOP: f32 = 10.0;
+const PADDING_BOTTOM: f32 = 24.0;
+
+/// Where each logical line's rows are in the wrapped galley: its first row's top, the height of
+/// all its rows together, and the height of the first row (for centring its number).
+struct LineGeometry {
+    entries: Vec<(usize, f32, f32, f32)>,
+}
+
+impl LineGeometry {
+    fn new(galley: &egui::Galley) -> Self {
+        let mut lines: Vec<(usize, f32, f32)> = Vec::new(); // (line, top, first row height)
+        let mut line = 0usize;
+        for placed in &galley.rows {
+            if lines.last().map(|entry| entry.0) != Some(line) {
+                lines.push((line, placed.pos.y, placed.row.size.y));
+            }
+            if placed.ends_with_newline {
+                line += 1;
+            }
+        }
+        let total = galley.size().y;
+        let mut entries: Vec<(usize, f32, f32, f32)> = Vec::with_capacity(lines.len());
+        for (index, (number, top, first_row)) in lines.iter().copied().enumerate() {
+            let bottom = lines.get(index + 1).map_or(total, |next| next.1);
+            entries.push((number, top, (bottom - top).max(first_row), first_row));
+        }
+        Self { entries }
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (usize, f32, f32, f32)> + '_ {
+        self.entries.iter().copied()
+    }
+
+    fn line(&self, line: usize) -> Option<(f32, f32, f32)> {
+        self.entries.iter().find(|entry| entry.0 == line).map(|entry| (entry.1, entry.2, entry.3))
+    }
+}
 
 /// What the editor's own layout looked like last frame, so a cursor move can tell whether it
 /// is already in sight.
 struct ViewGeom {
-    text_top: f32,
-    text_left: f32,
+    /// The content's top edge, in the scroll view's coordinates.
+    content_top: f32,
     clip: Rect,
-    row_h: f32,
 }
 
 /// What one frame of the editor produced.
@@ -63,6 +101,8 @@ pub struct Editor {
     coloured: Option<(u64, usize, bool)>,
     /// The editor's monospace size.
     pub size: f32,
+    /// The height of one row of the laid-out text (for small scroll adjustments).
+    row_h: f32,
     /// Modal editing for the source pane.
     pub vim: Vim,
     pub vim_bindings: bool,
@@ -85,6 +125,7 @@ impl Editor {
             runs: Arc::new(Vec::new()),
             coloured: None,
             size: 12.5,
+            row_h: 17.0,
             vim: Vim::new(),
             vim_bindings: true,
             vim_active: false,
@@ -149,11 +190,7 @@ impl Editor {
     /// Show the editor.
     pub fn show(&mut self, ui: &mut Ui, t: &Tokens) -> EditorOutput {
         let mono = FontId::monospace(self.size);
-        // The row height of a laid-out line is what the gutter must line up with; asking the
-        // font for it directly can differ by a rounding step.
-        let probe = ui.fonts_mut(|fonts| fonts.layout_no_wrap("M".to_owned(), mono.clone(), t.text));
-        let row_h = probe.rows.first().map(|row| row.row.height()).unwrap_or(1.0).max(1.0);
-        let char_w = ui.fonts_mut(|f| f.glyph_width(&mono, 'M')).max(1.0);
+        let char_w = ui.fonts_mut(|fonts| fonts.glyph_width(&mono, '0')).max(1.0);
         let id = ui.make_persistent_id("typst-source");
         if self.focus_on_show {
             self.focus_on_show = false;
@@ -182,24 +219,23 @@ impl Editor {
         }
         self.recolour(t);
 
-        let lines = self.line_count();
-        let digits = lines.to_string().len().max(2);
+        let digits = self.line_count().to_string().len().max(2);
         let gutter = digits as f32 * char_w + 26.0;
 
+        // A jump sets the caret; remember where it went so the view can follow it below.
         let mut scroll_to = None;
         if let Some((line, column)) = self.goto.take() {
+            let byte = self.byte_at(line, column);
             if self.vim_bindings {
-                let byte = self.byte_at(line, column);
                 self.vim.set_cursor(&self.text, byte);
             } else {
-                let byte = self.byte_at(line, column);
                 let index = self.text[..byte].chars().count();
                 let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
                 state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(index))));
                 state.store(ui.ctx(), id);
                 ui.memory_mut(|memory| memory.request_focus(id));
             }
-            scroll_to = Some(line);
+            scroll_to = Some(self.char_index(line, column));
         }
         // The modal layer's cursor is the truth; make the `TextEdit` show it.
         if self.vim_bindings {
@@ -213,87 +249,80 @@ impl Editor {
             self.cursor_byte = primary;
             self.cursor_line = line_of_byte(&self.text, primary);
             if self.vim.moved {
-                scroll_to = Some(self.cursor_line);
+                scroll_to = Some(byte_to_char(&self.text, primary));
             }
         }
 
-        let runs = self.runs.clone();
-        let base = t.text;
-        let layout_font = mono.clone();
-        let mut layouter = move |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
-            let text = buffer.as_str();
-            let mut job = LayoutJob::default();
-            job.wrap.max_width = wrap_width;
-            let mut at = 0usize;
-            for (range, color) in runs.iter() {
-                if range.start >= text.len() {
-                    break;
-                }
-                if range.start > at {
-                    append(&mut job, &layout_font, text, at, range.start, base);
-                }
-                let end = range.end.min(text.len());
-                if range.start < end {
-                    append(&mut job, &layout_font, text, range.start, end, *color);
-                }
-                at = end;
-            }
-            if at < text.len() {
-                append(&mut job, &layout_font, text, at, text.len(), base);
-            }
-            ui.fonts_mut(|fonts| fonts.layout_job(job))
-        };
+        // The text is laid out here rather than inside the `TextEdit`: the gutter, the current
+        // line and the diagnostics need the same wrapped geometry the text is drawn with, in the
+        // same frame. The `TextEdit` is handed this galley back, so it costs one layout.
+        let wrap_width = (ui.available_width() - gutter - 18.0).max(120.0);
+        let galley = self.layout(ui, &mono, wrap_width, t);
+        let geometry = LineGeometry::new(&galley);
+        self.row_h = galley.rows.first().map_or(self.size * 1.4, |row| row.row.size.y).max(1.0);
 
         let prompt: Option<(char, String)> = if self.vim_bindings { self.vim.prompt().map(|(sigil, line)| (sigil, line.to_string())) } else { None };
         let reserved = if prompt.is_some() { PROMPT_HEIGHT } else { 0.0 };
-        let mut scroll = egui::ScrollArea::both().auto_shrink([false, false]).id_salt(("source-scroll", id));
-        if let Some(line) = scroll_to {
-            let column = if self.vim_bindings { char_column(&self.text, line, self.vim.cursor()) } else { 0 };
-            let (vertical, horizontal) = self.scroll_offsets(line, column, row_h, char_w, gutter);
-            if let Some(vertical) = vertical {
-                scroll = scroll.vertical_scroll_offset(vertical);
-            }
-            if let Some(horizontal) = horizontal {
-                scroll = scroll.horizontal_scroll_offset(horizontal);
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(("source-scroll", id));
+        if let Some(index) = scroll_to {
+            if let Some(offset) = self.scroll_offset_for(&galley, index) {
+                scroll = scroll.vertical_scroll_offset(offset);
             }
         }
 
+        let laid = galley.clone();
+        let expected = self.text.len();
+        let base = t.text;
+        let mut layouter = move |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
+            if buffer.as_str().len() == expected {
+                return laid.clone();
+            }
+            // Should not happen (the buffer is the text we just laid out), but never hand the
+            // widget a galley that belongs to other text.
+            let mut job = LayoutJob::default();
+            job.wrap.max_width = wrap;
+            append(&mut job, &FontId::monospace(12.0), buffer.as_str(), 0, buffer.as_str().len(), base);
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        };
+
         let output = scroll.show(ui, |ui| {
             let clip = ui.clip_rect();
-            let longest = self.text.lines().map(|line| line.chars().count()).max().unwrap_or(0) as f32;
-            let content = vec2((gutter + longest * char_w + 48.0).max(clip.width()), (lines as f32 * row_h + 28.0 + reserved).max(clip.height()));
+            let content = vec2(clip.width().max(1.0), (PADDING_TOP + galley.size().y + PADDING_BOTTOM + reserved).max(clip.height()));
             let (rect, _) = ui.allocate_exact_size(content, egui::Sense::hover());
-            let text_rect = Rect::from_min_size(rect.min + vec2(gutter, 14.0), vec2(content.x - gutter, content.y - 14.0));
+            let text_origin = rect.min + vec2(gutter, PADDING_TOP);
+            let text_rect = Rect::from_min_size(text_origin, vec2(wrap_width, galley.size().y));
+            let painter = ui.painter().clone();
 
-            // The current line, under the text: the TextEdit's own frame is off, so this is
-            // visible behind the glyphs.
-            let line_top = text_rect.top() + self.cursor_line as f32 * row_h;
-            let row = Rect::from_min_max(pos2(text_rect.left(), line_top), pos2(clip.right(), line_top + row_h));
-            if row.intersects(clip) {
-                ui.painter().rect_filled(row, 0.0, if t.dark() { Color32::from_white_alpha(16) } else { Color32::from_black_alpha(14) });
-                let bar = Rect::from_min_max(pos2(text_rect.left() - 4.0, line_top), pos2(text_rect.left() - 1.0, line_top + row_h));
-                ui.painter().rect_filled(bar, 1.0, t.accent.gamma_multiply(0.55));
+            // The current line, under the text: the TextEdit's own frame is off, so this shows
+            // through behind the glyphs. A wrapped line is one band over all of its rows.
+            if let Some((top, height, _)) = geometry.line(self.cursor_line) {
+                let band = Rect::from_min_max(pos2(text_origin.x, text_origin.y + top), pos2(clip.right(), text_origin.y + top + height));
+                if band.intersects(clip) {
+                    painter.rect_filled(band, 0.0, if t.dark() { Color32::from_white_alpha(16) } else { Color32::from_black_alpha(14) });
+                    let bar = Rect::from_min_max(pos2(text_origin.x - 4.0, band.top()), pos2(text_origin.x - 1.0, band.bottom()));
+                    painter.rect_filled(bar, 1.0, t.accent.gamma_multiply(0.55));
+                }
             }
 
-            let first_visible = (((clip.top() - text_rect.top()) / row_h).floor() as isize).max(0) as usize;
-            let last_visible = (((clip.bottom() - text_rect.top()) / row_h).ceil() as isize).max(0) as usize + 1;
-            // Diagnostics: a washed band and a squiggle under the exact span, so the message has
-            // a place in the text and not only a line number.
+            // Diagnostics: the line is washed faintly, the offending span more strongly, so the
+            // eye finds the line first and then the column.
             let (error_color, warning_color) = diagnostic_colors(t);
-            for mark in self.marks.iter().filter(|mark| mark.line >= first_visible && mark.line <= last_visible) {
-                let row_top = text_rect.top() + mark.line as f32 * row_h;
-                let x0 = text_rect.left() + mark.column as f32 * char_w;
-                let x1 = (x0 + mark.len.max(1) as f32 * char_w).min(clip.right());
-                if x1 <= clip.left() {
-                    continue;
-                }
+            for mark in &self.marks {
+                let Some((top, height, _)) = geometry.line(mark.line) else { continue };
                 let color = if mark.error { error_color } else { warning_color };
-                // The whole line is washed faintly, the offending span more strongly: the eye
-                // finds the line first, then the column.
-                let line_band = Rect::from_min_max(pos2(clip.left() + gutter, row_top), pos2(clip.right(), row_top + row_h));
-                ui.painter().rect_filled(line_band, 0.0, color.gamma_multiply(if t.dark() { 0.07 } else { 0.045 }));
-                let band = Rect::from_min_max(pos2(x0.max(clip.left()), row_top + 1.0), pos2(x1, row_top + row_h - 2.0));
-                ui.painter().rect_filled(band, 2.0, color.gamma_multiply(if t.dark() { 0.16 } else { 0.10 }));
+                let line_band = Rect::from_min_max(pos2(text_origin.x, text_origin.y + top), pos2(clip.right(), text_origin.y + top + height));
+                if line_band.intersects(clip) {
+                    painter.rect_filled(line_band, 0.0, color.gamma_multiply(if t.dark() { 0.07 } else { 0.045 }));
+                }
+                for (x0, x1, row_top, row_h) in self.mark_segments(&galley, mark) {
+                    let band = Rect::from_min_max(
+                        pos2(text_origin.x + x0, text_origin.y + row_top + 1.0),
+                        pos2(text_origin.x + x1, text_origin.y + row_top + row_h - 2.0),
+                    );
+                    if band.intersects(clip) {
+                        painter.rect_filled(band, 2.0, color.gamma_multiply(if t.dark() { 0.16 } else { 0.10 }));
+                    }
+                }
             }
 
             let response = ui.put(
@@ -304,30 +333,34 @@ impl Editor {
                     .text_color(t.text)
                     .frame(egui::Frame::NONE)
                     .margin(vec2(0.0, 0.0))
-                    .desired_width(text_rect.width())
+                    .desired_width(wrap_width)
                     .lock_focus(true)
                     .layouter(&mut layouter),
             );
 
-            // The gutter is painted over the viewport's left edge, so the numbers stay put
-            // while the text scrolls sideways.
-            for mark in self.marks.iter().filter(|mark| mark.line >= first_visible && mark.line <= last_visible) {
-                let row_top = text_rect.top() + mark.line as f32 * row_h;
-                let x0 = (text_rect.left() + mark.column as f32 * char_w).max(clip.left());
-                let x1 = (text_rect.left() + (mark.column + mark.len.max(1)) as f32 * char_w).min(clip.right());
-                if x1 <= clip.left() {
-                    continue;
-                }
+            for mark in &self.marks {
                 let color = if mark.error { error_color } else { warning_color };
-                squiggle(ui.painter(), x0, x1, row_top + row_h - 1.5, color);
+                for (x0, x1, row_top, row_h) in self.mark_segments(&galley, mark) {
+                    let y = text_origin.y + row_top + row_h - 1.5;
+                    let x0 = (text_origin.x + x0).max(clip.left());
+                    let x1 = (text_origin.x + x1).min(clip.right());
+                    if x1 > x0 && y > clip.top() && y < clip.bottom() + row_h {
+                        squiggle(&painter, x0, x1, y, color);
+                    }
+                }
             }
 
+            // The gutter is painted over the viewport's left edge, so the numbers stay put while
+            // the text scrolls. Wrapped rows carry their line's number only on the first row.
             let gutter_rect = Rect::from_min_max(pos2(clip.left(), clip.top()), pos2(clip.left() + gutter, clip.bottom()));
-            ui.painter().rect_filled(gutter_rect, 0.0, t.panel);
-            ui.painter().vline(gutter_rect.right() - 0.5, gutter_rect.y_range(), Stroke::new(1.0, t.divider));
+            painter.rect_filled(gutter_rect, 0.0, t.panel);
+            painter.vline(gutter_rect.right() - 0.5, gutter_rect.y_range(), Stroke::new(1.0, t.divider));
             let number_font = FontId::monospace(self.size - 1.5);
-            for line in first_visible..last_visible.min(lines) {
-                let y = text_rect.top() + line as f32 * row_h + row_h * 0.5;
+            for (line, top, height, first_row_height) in geometry.entries() {
+                let y = text_origin.y + top + first_row_height * 0.5;
+                if y < clip.top() - self.row_h || y > clip.bottom() + self.row_h || y + height < clip.top() {
+                    continue;
+                }
                 let mark = self.marks.iter().find(|mark| mark.line == line);
                 let color = match mark {
                     Some(mark) if mark.error => error_color,
@@ -335,14 +368,13 @@ impl Editor {
                     None if line == self.cursor_line => t.accent_text,
                     None => t.text_faint.gamma_multiply(0.85),
                 };
-                ui.painter().text(pos2(gutter_rect.right() - 8.0, y), Align2::RIGHT_CENTER, (line + 1).to_string(), number_font.clone(), color);
+                painter.text(pos2(gutter_rect.right() - 8.0, y), Align2::RIGHT_CENTER, (line + 1).to_string(), number_font.clone(), color);
                 if mark.is_some() {
-                    // A tick in the gutter's left edge, the same mark the numbers carry.
-                    let bar = Rect::from_min_max(pos2(gutter_rect.left() + 2.0, y - row_h * 0.35), pos2(gutter_rect.left() + 4.5, y + row_h * 0.35));
-                    ui.painter().rect_filled(bar, 1.0, color);
+                    let bar = Rect::from_min_max(pos2(gutter_rect.left() + 2.0, y - first_row_height * 0.35), pos2(gutter_rect.left() + 4.5, y + first_row_height * 0.35));
+                    painter.rect_filled(bar, 1.0, color);
                 }
             }
-            self.view = Some(ViewGeom { text_top: text_rect.top(), text_left: text_rect.left(), clip, row_h });
+            self.view = Some(ViewGeom { content_top: rect.top(), clip });
             response
         });
 
@@ -376,20 +408,66 @@ impl Editor {
         EditorOutput { changed: output.inner.changed() || (self.vim_bindings && self.vim.changed), request }
     }
 
-    /// Where the view must scroll to so the cursor is in sight. `None` when the line (or the
-    /// character) is already visible, so a one-line motion does not move the view.
-    fn scroll_offsets(&self, line: usize, column: usize, row_h: f32, char_w: f32, gutter: f32) -> (Option<f32>, Option<f32>) {
+    /// Lay the buffer out with its syntax colours, wrapped at `wrap_width`.
+    fn layout(&self, ui: &Ui, mono: &FontId, wrap_width: f32, t: &Tokens) -> std::sync::Arc<egui::Galley> {
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = wrap_width;
+        let mut at = 0usize;
+        for (range, color) in self.runs.iter() {
+            if range.start >= self.text.len() {
+                break;
+            }
+            if range.start > at {
+                append(&mut job, mono, &self.text, at, range.start, t.text);
+            }
+            let end = range.end.min(self.text.len());
+            if range.start < end {
+                append(&mut job, mono, &self.text, range.start, end, *color);
+            }
+            at = end;
+        }
+        if at < self.text.len() {
+            append(&mut job, mono, &self.text, at, self.text.len(), t.text);
+        }
+        if self.text.is_empty() {
+            // An empty buffer still needs a row to put the caret on.
+            job.append(" ", 0.0, egui::TextFormat { font_id: mono.clone(), color: Color32::TRANSPARENT, ..Default::default() });
+        }
+        ui.fonts_mut(|fonts| fonts.layout_job(job))
+    }
+
+    /// The rectangles a diagnostic covers, in text-local coordinates: one per visual row, since
+    /// a wrapped span starts on one row and ends on another.
+    fn mark_segments(&self, galley: &egui::Galley, mark: &Mark) -> Vec<(f32, f32, f32, f32)> {
+        let start = self.char_index(mark.line, mark.column);
+        let end = self.char_index(mark.line, mark.column + mark.len.max(1));
+        let a = galley.pos_from_cursor(CCursor::new(start));
+        let b = galley.pos_from_cursor(CCursor::new(end));
+        let right = galley.size().x;
+        if (a.top() - b.top()).abs() < 1.0 {
+            return vec![(a.left(), b.left().min(right), a.top(), a.height())];
+        }
+        // Wrapped: the first row to its end, the last row from its start; a span of several rows
+        // is rare enough that the rows in between only carry the line wash.
+        vec![(a.left(), right, a.top(), a.height()), (0.0, b.left(), b.top(), b.height())]
+    }
+
+    /// The scroll offset that brings the caret at `index` into sight. `None` when it already is,
+    /// so a one-line motion does not move the view.
+    fn scroll_offset_for(&self, galley: &egui::Galley, index: usize) -> Option<f32> {
+        let caret = galley.pos_from_cursor(CCursor::new(index));
         let Some(view) = &self.view else {
-            return (Some((line as f32 * row_h - row_h * 8.0).max(0.0)), None);
+            return Some((PADDING_TOP + caret.top() - self.row_h * 8.0).max(0.0));
         };
-        let y = view.text_top + line as f32 * view.row_h;
-        let vertical_visible = y >= view.clip.top() && y + view.row_h <= view.clip.bottom();
-        let vertical = (!vertical_visible).then(|| (line as f32 * row_h - view.clip.height() * 0.35).max(0.0));
-        let x = view.text_left + column as f32 * char_w;
-        let band = view.clip.width() - gutter;
-        let horizontal_visible = x >= view.clip.left() + gutter + 4.0 && x <= view.clip.right() - 24.0;
-        let horizontal = (!horizontal_visible).then(|| (column as f32 * char_w - band * 0.25).max(0.0));
-        (vertical, horizontal)
+        let y = view.content_top + PADDING_TOP + caret.top();
+        let visible = y >= view.clip.top() && y + caret.height() <= view.clip.bottom();
+        (!visible).then(|| (PADDING_TOP + caret.top() - view.clip.height() * 0.35).max(0.0))
+    }
+
+    /// The character index of a line/column pair.
+    fn char_index(&self, line: usize, column: usize) -> usize {
+        let byte = self.byte_at(line, column);
+        self.text[..byte].chars().count()
     }
 
     fn prompt_bar(&self, ui: &Ui, t: &Tokens, mono: &FontId, sigil: char, line: &str) {
@@ -463,18 +541,6 @@ fn char_to_byte(text: &str, index: usize) -> usize {
 
 fn line_of_byte(text: &str, byte: usize) -> usize {
     text[..byte.min(text.len())].matches('\n').count()
-}
-
-/// The cursor's column in characters, when it sits on `line`.
-fn char_column(text: &str, line: usize, byte: usize) -> usize {
-    let mut start = 0;
-    for _ in 0..line {
-        match text[start..].find('\n') {
-            Some(offset) => start += offset + 1,
-            None => return 0,
-        }
-    }
-    text[start..byte.min(text.len())].chars().count()
 }
 
 fn append(job: &mut LayoutJob, mono: &FontId, text: &str, start: usize, end: usize, color: Color32) {
@@ -589,4 +655,34 @@ impl Palette {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wrapped_line_maps_to_its_first_row_and_takes_its_rows_together() {
+        let ctx = egui::Context::default();
+        // egui only has fonts after a pass has run.
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = 60.0;
+        job.append(
+            "aaaa bbbb cccc dddd\nee",
+            0.0,
+            TextFormat { font_id: egui::FontId::monospace(12.0), color: egui::Color32::WHITE, ..Default::default() },
+        );
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+        let geometry = LineGeometry::new(&galley);
+        let entries: Vec<(usize, f32, f32, f32)> = geometry.entries().collect();
+        assert_eq!(entries.len(), 2, "two logical lines");
+        assert_eq!(entries[0].0, 0);
+        assert_eq!(entries[1].0, 1);
+        // The first line wrapped, so its height is more than one row's, and the second line
+        // starts below it.
+        assert!(entries[0].2 > entries[0].3 + 1.0, "line 0 spans several rows");
+        assert!(entries[1].1 > entries[0].1 + entries[0].3, "line 1 starts below line 0's first row");
+    }
+
 }
