@@ -237,15 +237,23 @@ impl Editor {
             }
             scroll_to = Some(self.char_index(line, column));
         }
-        // The modal layer's cursor is the truth; make the `TextEdit` show it.
+        // The modal layer's cursor is the truth; make the `TextEdit` show it. Only when it has
+        // actually moved: egui rewrites the range it is given (it sets `prefer_next_row`), and
+        // storing our own copy every frame would look like a selection change on every frame -
+        // which makes the widget re-scroll to the caret and repaint the window at full rate.
         if self.vim_bindings {
             let (primary, secondary) = self.vim.caret(&self.text);
-            let mut range = CCursorRange::one(CCursor::new(byte_to_char(&self.text, primary)));
-            range.primary = CCursor::new(byte_to_char(&self.text, primary));
-            range.secondary = CCursor::new(byte_to_char(&self.text, secondary));
+            let (p, s) = (byte_to_char(&self.text, primary), byte_to_char(&self.text, secondary));
             let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-            state.cursor.set_char_range(Some(range));
-            state.store(ui.ctx(), id);
+            let current = state.cursor.char_range();
+            let same = current.is_some_and(|range| range.primary.index.0 == p && range.secondary.index.0 == s);
+            if !same {
+                let mut range = CCursorRange::one(CCursor::new(p));
+                range.primary = CCursor::new(p);
+                range.secondary = CCursor::new(s);
+                state.cursor.set_char_range(Some(range));
+                state.store(ui.ctx(), id);
+            }
             self.cursor_byte = primary;
             self.cursor_line = line_of_byte(&self.text, primary);
             if self.vim.moved {

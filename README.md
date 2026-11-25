@@ -234,6 +234,15 @@ result as an egui texture. A request whose page left the screen is replaced, not
 * **Raster scale is capped.** At very high zoom the page is stretched from a 3× raster
   instead of being re-rendered per tile, which is cheaper and blurrier than PdfCraft's tiling.
   Pages are also rendered whole, so a poster-sized page at high zoom costs a large texture.
+* **Empty IME pre-edit events are dropped.** Some compositors (KWin's text-input protocol, seen
+  here) send a "pre-edit: nothing" event with *every* frame while a text field has focus, and
+  egui repaints immediately whenever the frame carries any event — a self-sustaining 60 fps
+  redraw loop that made the source pane shimmer (and cost ~25% CPU on this box). The window
+  filters those empty pre-edits before any widget sees them; a real pre-edit (IME composition)
+  is passed through untouched. Relatedly, egui rewrites the caret range it is given (it sets
+  `prefer_next_row`), so the pane now only stores the range when the caret actually moved -
+  storing it every frame looked like a selection change on every frame, which made the widget
+  re-scroll to the caret on every frame.
 * **Vim is a subset.** See the table above: no marks, macros, block Visual, `.` repeat or named
   registers. Undo snapshots copy the whole buffer, so a very large document pays for `u`; the
   history keeps the last 400 changes.

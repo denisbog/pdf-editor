@@ -1528,6 +1528,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        drop_noisy_ime(ui);
         let ctx = ui.ctx().clone();
         if let Some(path) = self.pending_open.take() {
             self.open(path, &ctx, None);
@@ -1916,6 +1917,20 @@ fn marks_for(text: &str, diagnostics: &[Diagnostic]) -> Vec<editor::Mark> {
         marks.push(editor::Mark { line, column, len, error: diagnostic.is_error() });
     }
     marks
+}
+
+/// Drop the empty IME pre-edit events some compositors send with every frame. egui repaints
+/// immediately whenever the frame carries any event, so a steady trickle of "pre-edit: nothing"
+/// keeps the window redrawing at the refresh rate - and the editor shimmering with it. An empty
+/// pre-edit means "composition cleared", which is a no-op for us.
+fn drop_noisy_ime(ui: &egui::Ui) {
+    fn empty_preedit(event: &egui::Event) -> bool {
+        matches!(event, egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if text.is_empty())
+    }
+    if !ui.input(|input| input.events.iter().any(empty_preedit)) {
+        return;
+    }
+    ui.ctx().input_mut(|input| input.events.retain(|event| !empty_preedit(event)));
 }
 
 /// Shorten a label to `max` characters, marking the cut with an ellipsis.
