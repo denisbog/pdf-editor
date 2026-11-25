@@ -1719,28 +1719,42 @@ fn problems_panel(ui: &mut egui::Ui, doc: &mut Doc, filter: &mut String) {
                 Some(file) => format!("{file}:{}:{}", diagnostic.line + 1, diagnostic.column + 1),
                 None => format!("{}:{}", diagnostic.line + 1, diagnostic.column + 1),
             };
-            let response = Frame::NONE.corner_radius(CornerRadius::same(6)).inner_margin(Margin { left: 8, right: 8, top: 6, bottom: 7 }).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    icons::paint(ui, Rect::from_min_size(ui.cursor().min, vec2(14.0, 14.0)), if diagnostic.is_error() { "triangle-alert" } else { "info" }, 13.0, color);
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(&diagnostic.message).font(theme::regular(12.5)).color(t.text));
-                });
-                ui.horizontal(|ui| {
-                    ui.add_space(20.0);
-                    ui.label(RichText::new(where_).font(theme::regular(10.5)).color(t.text_faint));
-                });
-                for hint in &diagnostic.hints {
+            // The row's background is reserved before its text, so the hover fill lands behind
+            // the message instead of over it, and it spans the whole panel like a list row.
+            let background = ui.painter().add(egui::Shape::Noop);
+            let border = ui.painter().add(egui::Shape::Noop);
+            let inner = Frame::NONE
+                .inner_margin(Margin { left: 8, right: 8, top: 6, bottom: 7 })
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        // Reserve the icon's box: painting alone would let the message start on
+                        // top of it.
+                        let (icon_rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                        icons::paint(ui, icon_rect, if diagnostic.is_error() { "triangle-alert" } else { "info" }, 13.0, color);
+                        ui.label(RichText::new(&diagnostic.message).font(theme::regular(12.5)).color(t.text));
+                    });
                     ui.horizontal(|ui| {
                         ui.add_space(20.0);
-                        ui.label(RichText::new(hint).font(theme::regular(11.0)).color(t.text_muted));
+                        ui.label(RichText::new(where_).font(theme::regular(10.5)).color(t.text_faint));
                     });
-                }
-            });
-            let response = ui.interact(response.response.rect, ui.id().with(("problem", diagnostic.line, diagnostic.column, &diagnostic.message)), Sense::click());
-            if response.hovered() {
-                ui.painter().rect_filled(response.rect, CornerRadius::same(6), t.hover);
-            }
+                    for hint in &diagnostic.hints {
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(RichText::new(hint).font(theme::regular(11.0)).color(t.text_muted));
+                        });
+                    }
+                });
+            let bounds = ui.max_rect();
+            let rect = Rect::from_min_max(pos2(bounds.left(), inner.response.rect.top()), pos2(bounds.right(), inner.response.rect.bottom()));
+            let response = ui
+                .interact(rect, ui.id().with(("problem", diagnostic.line, diagnostic.column, &diagnostic.message)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let fill = if response.hovered() { t.hover } else { Color32::TRANSPARENT };
+            ui.painter().set(background, egui::Shape::rect_filled(rect, CornerRadius::same(6), fill));
+            // A faint rule between entries, so a hovered row reads as one item.
+            let rule = if response.hovered() { t.divider } else { Color32::TRANSPARENT };
+            ui.painter().set(border, egui::Shape::line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, rule)));
             if response.clicked() && diagnostic.file.is_none() {
                 jump = Some((diagnostic.line, diagnostic.column));
             }
