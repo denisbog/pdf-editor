@@ -54,12 +54,12 @@ static FONTS_READY: AtomicBool = AtomicBool::new(false);
 
 /// Grab the fonts ahead of the first compile, off the UI thread, so the first render is not
 /// delayed by the system font scan.
-pub fn warm_fonts(ctx: Option<egui::Context>) {
+pub fn warm_fonts(waker: Option<crate::engine::Waker>) {
     std::thread::spawn(move || {
         let _ = fonts();
         mark_fonts_ready();
-        if let Some(ctx) = ctx {
-            ctx.request_repaint();
+        if let Some(waker) = waker {
+            waker.wake();
         }
     });
 }

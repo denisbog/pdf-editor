@@ -1,0 +1,31 @@
+[package]
+name = "pdf-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "A Typst editor whose page view is the typeset document: edit the source, read the pages, export the PDF"
+
+[[bin]]
+name = "pdf-editor"
+path = "src/main.rs"
+
+[dependencies]
+pdf-editor-core = { path = "../core" }
+typst.workspace = true
+typst-layout.workspace = true
+typst-pdf.workspace = true
+
+egui = "0.36"
+# `epaint` is egui's own paint/text crate: only `text::VariationCoords` is used here, to pick
+# a `wght` instance of the variable UI fonts.
+epaint = { version = "0.36", default-features = false }
+egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence", "accesskit", "x11", "wayland", "links"] }
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lucide-static-svg.workspace = true
+damascene-fonts-inter.workspace = true
+damascene-fonts-jetbrains-mono.workspace = true

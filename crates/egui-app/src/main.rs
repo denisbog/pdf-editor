@@ -11,11 +11,12 @@
 
 mod app;
 mod editor;
-mod engine;
 mod icons;
 mod theme;
-mod vim;
+mod vim_input;
 mod widgets;
+
+use pdf_editor_core::engine;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();

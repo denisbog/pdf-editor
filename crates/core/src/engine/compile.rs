@@ -19,6 +19,7 @@ use typst::{World, WorldExt};
 
 use typst_layout::{Page, PagedDocument};
 
+use super::wake::Waker;
 use super::world::{self, TypstWorld};
 
 /// A diagnostic, in the form the problems panel shows.
@@ -55,6 +56,23 @@ pub struct Hit {
     pub line: usize,
 }
 
+/// One glyph (or glyph cluster) of the page, with the source byte it was set from.
+///
+/// The joined [`Hit`]s are what a hover highlight and a coarse click want; these are the
+/// finer grain a caret placement needs, so a click inside a long line lands on the word (and
+/// column) under the pointer rather than at the line's first character.
+#[derive(Clone, Copy, Debug)]
+pub struct Glyph {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    /// 0-based line of the source the glyph came from.
+    pub line: usize,
+    /// Byte offset of the source span the glyph came from.
+    pub byte: usize,
+}
+
 /// One page of the compiled document.
 #[derive(Clone, Debug, Default)]
 pub struct PageMeta {
@@ -62,6 +80,7 @@ pub struct PageMeta {
     pub width: f32,
     pub height: f32,
     pub hits: Vec<Hit>,
+    pub glyphs: Vec<Glyph>,
 }
 
 /// What one compile produced: either pages, or the errors that stopped it.
@@ -102,14 +121,14 @@ pub struct Compiler {
 }
 
 impl Compiler {
-    pub fn spawn(ctx: egui::Context) -> Self {
+    pub fn spawn(waker: Waker) -> Self {
         let (requests, request_rx) = channel::<Request>();
         let (event_tx, events) = channel::<Event>();
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer = log.clone();
         std::thread::Builder::new()
             .name("typst-compile".to_string())
-            .spawn(move || run(request_rx, event_tx, writer, ctx))
+            .spawn(move || run(request_rx, event_tx, writer, waker))
             .expect("the compile thread starts");
         Self { requests, events, log }
     }
@@ -139,7 +158,7 @@ impl Compiler {
     }
 }
 
-fn run(requests: Receiver<Request>, events: Sender<Event>, log: Arc<std::sync::Mutex<Vec<String>>>, ctx: egui::Context) {
+fn run(requests: Receiver<Request>, events: Sender<Event>, log: Arc<std::sync::Mutex<Vec<String>>>, waker: Waker) {
     // The fonts are loaded here, on this thread, so the window is already up while the system
     // font directories are scanned.
     let fonts = world::fonts();
@@ -148,7 +167,7 @@ fn run(requests: Receiver<Request>, events: Sender<Event>, log: Arc<std::sync::M
         if let Ok(mut log) = log.lock() {
             log.push(format!("{} font families available", fonts.book().families().count()));
         }
-        ctx.request_repaint();
+        waker.wake();
     }
     while let Ok(request) = requests.recv() {
         match request {
@@ -183,7 +202,7 @@ fn run(requests: Receiver<Request>, events: Sender<Event>, log: Arc<std::sync::M
                     }
                 }
                 let _ = events.send(Event::Compiled { id, gen, outcome });
-                ctx.request_repaint();
+                waker.wake();
             }
             other => handle_export(other, &events, &log),
         }
@@ -266,9 +285,11 @@ fn diagnostic(world: &TypstWorld, source_diagnostic: &SourceDiagnostic) -> Diagn
 fn page_meta(world: &TypstWorld, page: &Page) -> PageMeta {
     let size = page.frame.size();
     let mut hits = Vec::new();
-    walk(world, &page.frame, Transform::identity(), &mut hits);
+    let mut glyphs = Vec::new();
+    walk(world, &page.frame, Transform::identity(), &mut hits, &mut glyphs);
     hits.sort_by_key(|hit| (hit.line, float_key(hit.y0), float_key(hit.x0)));
-    PageMeta { width: size.x.to_pt() as f32, height: size.y.to_pt() as f32, hits: join(hits) }
+    glyphs.sort_by_key(|glyph| (glyph.line, float_key(glyph.y0), float_key(glyph.x0)));
+    PageMeta { width: size.x.to_pt() as f32, height: size.y.to_pt() as f32, hits: join(hits), glyphs }
 }
 
 fn float_key(value: f32) -> i64 {
@@ -276,7 +297,7 @@ fn float_key(value: f32) -> i64 {
 }
 
 /// Walk the page's frames and index the placed text by source line.
-fn walk(world: &TypstWorld, frame: &Frame, transform: Transform, hits: &mut Vec<Hit>) {
+fn walk(world: &TypstWorld, frame: &Frame, transform: Transform, hits: &mut Vec<Hit>, glyphs: &mut Vec<Glyph>) {
     for (position, item) in frame.items() {
         let at = apply(transform, *position);
         match item {
@@ -284,7 +305,7 @@ fn walk(world: &TypstWorld, frame: &Frame, transform: Transform, hits: &mut Vec<
                 // As the renderer does: the group's frame is drawn at the item's position and
                 // then transformed.
                 let at = transform.pre_concat(Transform::translate(position.x, position.y));
-                walk(world, &group.frame, at.pre_concat(group.transform), hits);
+                walk(world, &group.frame, at.pre_concat(group.transform), hits, glyphs);
             }
             FrameItem::Text(text) => {
                 let scale = transform.sx.get() as f32;
@@ -299,7 +320,10 @@ fn walk(world: &TypstWorld, frame: &Frame, transform: Transform, hits: &mut Vec<
                     }
                     let Some(line) = line_of(world, glyph.span.0) else { continue };
                     let baseline = at.y.to_pt() as f32;
-                    hits.push(Hit { x0, y0: baseline - size * 0.82, x1, y1: baseline + size * 0.22, line });
+                    let y0 = baseline - size * 0.82;
+                    let y1 = baseline + size * 0.22;
+                    hits.push(Hit { x0, y0, x1, y1, line });
+                    glyphs.push(Glyph { x0, y0, x1, y1, line, byte: byte_of(world, glyph.span.0).unwrap_or(0) });
                 }
             }
             _ => {}
@@ -312,6 +336,14 @@ fn apply(transform: Transform, point: Point) -> Point {
         transform.sx.of(point.x) + transform.kx.of(point.y) + transform.tx,
         transform.ky.of(point.x) + transform.sy.of(point.y) + transform.ty,
     )
+}
+
+/// The byte offset in the main source that a span covers.
+fn byte_of(world: &TypstWorld, span: typst::syntax::Span) -> Option<usize> {
+    if span.id() != Some(world.main()) {
+        return None;
+    }
+    world.range(span).map(|range| range.start)
 }
 
 /// The 0-based line of the main source that a span came from.
@@ -342,6 +374,29 @@ fn join(hits: Vec<Hit>) -> Vec<Hit> {
         joined.push(hit);
     }
     joined
+}
+
+/// The source line and column a click at `(x, y)` (page points) lands on.
+///
+/// The line comes from the glyph under the pointer, so it is exact even in a run that spans
+/// several source lines; the column is counted in `text`, which must be the text that was
+/// compiled.
+pub fn position_at(pages: &[PageMeta], page: usize, x: f32, y: f32, text: &str) -> Option<(usize, usize)> {
+    let meta = pages.get(page)?;
+    let mut best: Option<(f32, Glyph)> = None;
+    for glyph in &meta.glyphs {
+        let dx = (glyph.x0 - x).max(x - glyph.x1).max(0.0);
+        let dy = (glyph.y0 - y).max(y - glyph.y1).max(0.0);
+        if dx > 6.0 || dy > 6.0 {
+            continue;
+        }
+        let distance = dx * dx + dy * dy;
+        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+            best = Some((distance, *glyph));
+        }
+    }
+    let (_, glyph) = best?;
+    Some((glyph.line, crate::document::column_at_byte(text, glyph.byte)))
 }
 
 /// The page a click at `(x, y)` (page points) lands in, as a source line.
@@ -384,8 +439,24 @@ mod tests {
     }
 
     #[test]
+    fn a_click_picks_the_glyph_under_it_for_a_line_and_column() {
+        let text = "= Title\n\nSome words on one line\n";
+        let start = text.find("Some").unwrap();
+        let mut glyphs = Vec::new();
+        for (index, word) in ["Some", "words", "on"].iter().enumerate() {
+            let x = 40.0 + index as f32 * 50.0;
+            glyphs.push(Glyph { x0: x, y0: 60.0, x1: x + 40.0, y1: 72.0, line: 2, byte: start + text[start..].find(word).unwrap() });
+        }
+        let pages = vec![PageMeta { width: 400.0, height: 600.0, hits: Vec::new(), glyphs }];
+        assert_eq!(position_at(&pages, 0, 45.0, 66.0, text), Some((2, 0)));
+        assert_eq!(position_at(&pages, 0, 95.0, 66.0, text), Some((2, 5)));
+        assert_eq!(position_at(&pages, 0, 160.0, 66.0, text), Some((2, 11)));
+        assert_eq!(position_at(&pages, 0, 45.0, 400.0, text), None);
+    }
+
+    #[test]
     fn a_click_maps_to_the_line_of_the_run_under_it() {
-        let pages = vec![PageMeta { width: 400.0, height: 600.0, hits: vec![hit(56.0, 300.0, 60.0, 72.0, 7)] }];
+        let pages = vec![PageMeta { width: 400.0, height: 600.0, hits: vec![hit(56.0, 300.0, 60.0, 72.0, 7)], glyphs: Vec::new() }];
         assert_eq!(line_at(&pages, 0, 100.0, 66.0), Some(7));
         // Within a few points of the run still counts (the pointer is not a pixel).
         assert_eq!(line_at(&pages, 0, 100.0, 76.0), Some(7));

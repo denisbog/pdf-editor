@@ -124,16 +124,31 @@ editor and the badge disappears.
 
 ## Build & run
 
+The workspace builds two windows over the same engine and the same vim machine:
+
+| binary | window layer | source editor |
+| --- | --- | --- |
+| `pdf-editor` | egui/eframe 0.36 | our own pane (`crates/egui-app/src/editor.rs`) |
+| `pdf-editor-iced` | iced 0.14 | `typst-iced-editor` 0.2 (cosmic-text) |
+
 ```bash
 cd ~/llm/pdf-editor
-cargo run --release -- doc/demo.typ
+cargo run --release -p pdf-editor      -- doc/demo.typ   # the egui build
+cargo run --release -p pdf-editor-iced -- doc/demo.typ   # the iced build
 ```
+
+Both read the same `doc/demo.typ`, compile it with the same thread, render the same pages, and
+share the settings file, so switching between them is safe. The iced build is the one to use if
+the source contains bidirectional or complex-script text — see
+[Two windows, one engine](#two-windows-one-engine).
 
 A `.typ` file named on the command line opens in a tab; without an argument the documents of
 the last session are reopened (new, never-saved documents are not restored). **Open…**
 (`Ctrl+O`) picks another; **New** (`Ctrl+N`) starts a document from a small template.
 
 ### Debug helpers (no UI)
+
+The helpers live in the egui binary (`pdf-editor`); the iced one is window-only.
 
 ```bash
 # compile a file and write the PDF (defaults to the file's own name)
@@ -156,7 +171,53 @@ PDF_EDITOR_SAVE_DIR=/tmp/out PDF_EDITOR_EXPORT_DIR=/tmp/out pdf-editor doc/demo.
 ```
 
 Then `Ctrl+S` writes `/tmp/out/demo.typ` and `Ctrl+E` writes `/tmp/out/demo.pdf` without
-opening a dialog.
+opening a dialog. `PDF_EDITOR_SETTINGS=/tmp/settings.json` moves the settings file (both
+builds honour it), which is what the headless screenshots use.
+
+## Two windows, one engine
+
+The window layer is a shell over `crates/core`; nothing in the engine, the page geometry or
+the vim state machine knows which toolkit drew it. What the two shells buy:
+
+| | egui build | iced build |
+| --- | --- | --- |
+| Source text shaping | harfrust, no bidi: an Arabic or Hebrew line is drawn left-to-right and the monospace face may have no glyphs for it at all (boxes). | cosmic-text: bidi, Arabic joining, Hebrew, emoji. The same line renders in visual order, exactly as the page does. |
+| Modal editing | `crates/egui-app/src/vim_input.rs` takes the frame's event queue and filters it before `TextEdit` sees it. | `CodeEditor::key_binding` hands every press to `vim` in Normal/Visual/Command mode, and falls back to the editor's own bindings in Insert mode. |
+| Caret placement from a page click | line only (`engine::line_at`). | line **and** column (`engine::position_at`, fed by the per-glyph source byte the compile indexes). |
+| Chrome | PdfCraft's immediate-mode widgets. | the same tokens as iced styles (`container`, `button`, `scrollable`, `svg` icons). |
+| Accessibility | accesskit, shipped by eframe. | none (iced has no accesskit yet). |
+
+The iced build reached parity on the visible features: tab strip, mode bar with the view tabs,
+palette and zoom, both rails, the Problems/Document/Log panels, the draggable source/pages
+split and side-panel grip, toasts, the shortcuts and unsaved-changes overlays, fit-to-width,
+zoom anchoring (`Ctrl` + wheel included), spread, pan, raster refresh, export, session restore
+and the same vim subset.
+
+Its window follows one small design system: a single `theme::Tokens` (colours, radii, metrics,
+the Inter/JetBrains Mono faces), one `widgets.rs` vocabulary every control is built from, and
+one keyboard path — `Esc` closes exactly one layer (palette → shortcuts → dialog), an open
+overlay swallows global shortcuts, icon-only controls carry tooltips, unavailable actions are
+`on_press_maybe(None)` rather than silently dead, closed panels with content get a rail dot,
+and panels share one 40 px header + scrolling body. The tab strip, mode bar, rails and panels
+are pure projections of `App`; floating layers are siblings in a `Stack`, so a palette or a
+dialog never reflows the document behind it.
+
+Two differences remain: iced exposes no widget id for the code editor, so the source pane takes
+the keyboard on the first click rather than on launch; and there is no accessibility tree.
+
+The egui build stays the default: it is the one with the debug CLI and accessibility.
+
+The same document in the iced build (`doc/demo.typ`):
+
+![](doc/screenshot-iced.png)
+
+The reason the port was worth its cost is visible with a bidirectional document. The egui
+source pane draws the Arabic line as boxes in logical order; the iced pane shapes and orders
+it. The typeset pages are identical in both, because they come from the same compile.
+
+| egui | iced |
+| --- | --- |
+| ![](doc/bidi-egui.png) | ![](doc/bidi-iced.png) |
 
 ## Chrome and shortcuts
 
@@ -187,14 +248,22 @@ scrolls text there and turns pages everywhere else.
 
 | file | role |
 | --- | --- |
-| `src/main.rs` | entry point and the debug CLI |
-| `src/app.rs` | the window: chrome, document tabs, page stack, panels, click-to-source, session, export |
-| `src/editor.rs` | the source editor: buffer, Typst syntax colours, gutter, current line, go-to-line, the command line |
-| `src/vim.rs` | the modal layer: modes, motions, operators, text objects, registers, undo, search |
-| `src/engine/world.rs` | the `typst::World`: the buffer as main source, includes from the document's folder, fonts, date |
-| `src/engine/compile.rs` | the compile thread (compile, diagnostics, text index for click-to-source, PDF export) |
-| `src/engine/mod.rs` | the raster pool that turns compiled pages into textures at the requested zoom |
-| `src/theme.rs`, `src/icons.rs`, `src/widgets.rs` | PdfCraft's design tokens, Lucide icons and chrome widgets |
+| `crates/core/src/engine/world.rs` | the `typst::World`: the buffer as main source, includes from the document's folder, fonts, date |
+| `crates/core/src/engine/compile.rs` | the compile thread (compile, diagnostics, glyph index for click-to-source, PDF export) |
+| `crates/core/src/engine/mod.rs` | the raster pool that turns compiled pages into textures at the requested zoom |
+| `crates/core/src/vim.rs` | the modal layer: modes, motions, operators, text objects, registers, undo, search, command line |
+| `crates/core/src/source.rs` | the `Source` trait and `Edit` the modal layer edits through |
+| `crates/core/src/document.rs` | settings and session, theme kinds, diagnostic → mark conversion, path helpers |
+| `crates/egui-app/src/main.rs` | entry point and the debug CLI |
+| `crates/egui-app/src/app.rs` | the egui window: chrome, tabs, page stack, panels, click-to-source, session, export |
+| `crates/egui-app/src/editor.rs` | the egui source pane: buffer, syntax colours, gutter, current line, go-to-line, command line |
+| `crates/egui-app/src/vim_input.rs` | the egui event filter that feeds the shared vim machine |
+| `crates/egui-app/src/theme.rs`, `icons.rs`, `widgets.rs` | PdfCraft's design tokens, Lucide icons and chrome widgets |
+| `crates/iced-app/src/app.rs` | the iced application: `Message`/`update`/`view`, chrome, tabs, page stack, panels, overlays, keyboard priority |
+| `crates/iced-app/src/widgets.rs` | the one widget vocabulary: icon/ghost/pill buttons, tabs, search box, list row, panel shell, scrollable, tooltip, scrim, toast, empty state |
+| `crates/iced-app/src/pages.rs` | page layout, current page, click → `(line, column)` |
+| `crates/iced-app/src/vim.rs` | the vim adapter on `key_binding`/`Action` and the text diff |
+| `crates/iced-app/src/theme.rs`, `icons.rs` | the same tokens as iced styles and SVG icons, chrome metrics and the Inter/JetBrains Mono faces |
 
 **Compiling.** `typst::compile::<PagedDocument>` runs on a dedicated thread that owns the
 `PagedDocument` and the last word: when a newer buffer is queued while a compile runs, the
@@ -211,17 +280,21 @@ nothing (the page still shows it).
 
 **Rasterising.** A pool of threads takes `(page, scale, tag)` requests from the UI each frame,
 in order of urgency (the page in view first), renders the page with `typst-render` at the
-requested scale (capped at 3× device pixels per point and 24 Mpx per page), and uploads the
-result as an egui texture. A request whose page left the screen is replaced, not queued.
+requested scale (capped at 3× device pixels per point and 24 Mpx per page), and hands the RGBA
+back: egui uploads it as a texture, iced as an `image::Handle`. A request whose page left the
+screen is replaced, not queued.
 
 **Export.** The same `PagedDocument` is handed to the compile thread, which writes it with
 `typst-pdf` — so the PDF cannot differ from what was on screen.
 
-**Moving the window layer to iced** is planned but deferred: the engine, the page view's data and
-the vim state machine are toolkit-independent, and iced's text shaping (bidi, complex scripts) and
-its modal `key_binding` hook are the two things egui cannot offer. The inventory, the adapter
-design for vim, the phases and the acceptance tests are written down in
-[doc/iced-port.md](doc/iced-port.md).
+**Two front-ends.** The engine (`world`, `compile`, raster pool), the vim machine and the
+document model live in `crates/core`; the egui and iced binaries are shells over it. The vim
+machine speaks byte offsets into a plain `String` and a toolkit-neutral `Key`, so the same
+1.8k lines of motions/operators/text objects run in both. The iced shell turns each command's
+mutation into the difference between the old and the new text and applies it as one
+`Action::Replace`, which keeps the editor's syntax tree, history and scroll story intact.
+The plan, the inventory and the acceptance tests are in [doc/iced-port.md](doc/iced-port.md);
+the "Implemented" section there records what landed and where it deviates.
 
 ## Notes and limitations
 
@@ -262,10 +335,12 @@ design for vim, the phases and the acceptance tests are written down in
 * **Vim is a subset.** See the table above: no marks, macros, block Visual, `.` repeat or named
   registers. Undo snapshots copy the whole buffer, so a very large document pays for `u`; the
   history keeps the last 400 changes.
-* **Text index is per line, not per word.** A click anywhere in a run of glyphs set from one
-  source line lands at the start of that line; the caret is not placed at the character.
-* **The session lives in eframe's storage** (`~/.local/share/pdfeditor/app.ron`), together
-  with the zoom and the theme, and is written every ten seconds and at exit.
+* **Click-to-source granularity differs by shell.** The egui build lands on the start of the
+  source line that set the glyphs; the iced build indexes individual glyphs and lands on the
+  line **and column** under the pointer.
+* **The session and settings live in one JSON file**, `${XDG_CONFIG_HOME:-~/.config}/pdf-editor/settings.json`
+  (or `PDF_EDITOR_SETTINGS`), shared by both builds: zoom, theme, view, split and panel widths,
+  vim on/off and the reopened tabs. The egui build no longer uses eframe's storage.
 * **New documents live in the working directory.** `Ctrl+N` names the buffer
   `untitled.typ` (or `untitled-2.typ`, …) next to the process; until it is saved it is not
   restored in the next session.

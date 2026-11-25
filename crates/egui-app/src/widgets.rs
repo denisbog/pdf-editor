@@ -52,8 +52,13 @@ pub fn search_box(ui: &mut egui::Ui, placeholder: &str, width: f32) -> Response 
     let shortcut = ui.painter().layout_no_wrap(shortcut, theme::regular(11.5), t.text_faint);
     let shortcut_pos = rect.right_center() - vec2(12.0 + shortcut.size().x, shortcut.size().y * 0.5);
     let text_left = rect.left() + 34.0;
-    ui.painter().text(egui::pos2(text_left, rect.center().y), Align2::LEFT_CENTER, placeholder, theme::regular(13.0), t.text_faint);
-    ui.painter().galley(shortcut_pos, shortcut, t.text_faint);
+    let placeholder = ui.painter().layout_no_wrap(placeholder.to_owned(), theme::regular(13.0), t.text_faint);
+    // The shortcut hint is a nicety, not a label: drop it rather than let it run into the
+    // placeholder when the box is narrow.
+    if text_left + placeholder.size().x + 8.0 <= shortcut_pos.x {
+        ui.painter().galley(shortcut_pos, shortcut, t.text_faint);
+    }
+    ui.painter().galley(egui::pos2(text_left, rect.center().y - placeholder.size().y * 0.5), placeholder, t.text_faint);
     resp.on_hover_cursor(egui::CursorIcon::Text)
 }
 

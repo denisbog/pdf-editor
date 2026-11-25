@@ -5,52 +5,7 @@ use std::sync::Arc;
 
 use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Stroke, Visuals};
 use epaint::text::VariationCoords;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum ThemeKind {
-    #[default]
-    Light,
-    Dark,
-}
-
-/// The saved choice, independent of the colours currently displayed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum ThemePreference {
-    System,
-    #[default]
-    Light,
-    Dark,
-}
-
-impl ThemePreference {
-    pub fn resolve(self, system: Option<egui::Theme>, fallback: ThemeKind) -> ThemeKind {
-        match self {
-            Self::Light => ThemeKind::Light,
-            Self::Dark => ThemeKind::Dark,
-            Self::System => match system {
-                Some(egui::Theme::Light) => ThemeKind::Light,
-                Some(egui::Theme::Dark) => ThemeKind::Dark,
-                None => fallback,
-            },
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::System => "Use system setting",
-            Self::Light => "Light gray",
-            Self::Dark => "Dark gray",
-        }
-    }
-
-    pub fn icon(self) -> &'static str {
-        match self {
-            Self::System => "settings",
-            Self::Light => "sun",
-            Self::Dark => "moon",
-        }
-    }
-}
+pub use pdf_editor_core::document::ThemeKind;
 
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
@@ -168,9 +123,9 @@ pub fn font_definitions() -> FontDefinitions {
     add(&mut fonts, "Inter-SemiBold", damascene_fonts_inter::INTER_VARIABLE, Some(600.0));
     add(&mut fonts, "JetBrainsMono", damascene_fonts_jetbrains_mono::JETBRAINS_MONO_VARIABLE, Some(400.0));
     // The document serif: translations are set in it so they read like the page they translate.
-    add(&mut fonts, "SourceSerif", include_bytes!("../assets/fonts/SourceSerifPro-Regular.otf"), None);
-    add(&mut fonts, "SourceSerif-Bold", include_bytes!("../assets/fonts/SourceSerifPro-Bold.otf"), None);
-    add(&mut fonts, "SourceSerif-Italic", include_bytes!("../assets/fonts/SourceSerifPro-It.otf"), None);
+    add(&mut fonts, "SourceSerif", include_bytes!("../../../assets/fonts/SourceSerifPro-Regular.otf"), None);
+    add(&mut fonts, "SourceSerif-Bold", include_bytes!("../../../assets/fonts/SourceSerifPro-Bold.otf"), None);
+    add(&mut fonts, "SourceSerif-Italic", include_bytes!("../../../assets/fonts/SourceSerifPro-It.otf"), None);
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "Inter".to_owned());
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "JetBrainsMono".to_owned());
     let fallback: Vec<String> = fonts.families[&FontFamily::Proportional].clone();

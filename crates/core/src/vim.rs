@@ -1,8 +1,9 @@
 //! Vim motions for the source pane.
 //!
-//! The editor is an egui `TextEdit`, so this module is the modal layer in front of it: while the
-//! editor has focus it takes the keyboard, keeps its own cursor, and only lets keys through to
-//! the `TextEdit` in Insert mode. Every command edits the buffer directly and records an undo
+//! This is the modal state machine, shared byte-for-byte by both front-ends. It keeps its own
+//! cursor (byte offsets), speaks a toolkit-neutral [`Key`], and mutates a plain `String`: in
+//! Insert mode the front-end's own editor widget takes the typing, in Normal and Visual mode
+//! this layer takes every key. Every command edits the buffer directly and records an undo
 //! snapshot, so `u` and `Ctrl+R` behave the same in both modes.
 //!
 //! Implemented: Normal, Insert, Visual (char and line) and Command-line modes; counts;
@@ -15,8 +16,82 @@
 //! Deliberately absent (see the README): marks, macros, block visual (`Ctrl+V`), `.` repeat,
 //! named registers, `zz`/`zt`/`zb`, and folding.
 
-use egui::Key;
 use std::ops::Range;
+
+/// The keys the modal layer cares about, independent of any toolkit.
+///
+/// Each front-end translates its own key type into this (`egui::Key` in `pdf-editor`, iced's
+/// `keyboard::Key` in `pdf-editor-iced`), so the machine below never learns which window
+/// library is running it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Key {
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Num0,
+    Num1,
+    Num2,
+    Num3,
+    Num4,
+    Num5,
+    Num6,
+    Num7,
+    Num8,
+    Num9,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Escape,
+    Enter,
+    Backspace,
+    Space,
+    Colon,
+    Comma,
+    Period,
+    Semicolon,
+    Quote,
+    Slash,
+    Backslash,
+    Pipe,
+    Questionmark,
+    Exclamationmark,
+    OpenBracket,
+    CloseBracket,
+    OpenCurlyBracket,
+    CloseCurlyBracket,
+    Backtick,
+    Minus,
+    Plus,
+    Equals,
+}
 
 /// Which mode the editor is in. Operator-pending stays Normal, as in Vim.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -261,75 +336,45 @@ impl Vim {
 
     /// Take this frame's keyboard events. In Normal and Visual mode everything is ours; in
     /// Insert mode only Escape and the undo keys are.
-    pub fn handle(&mut self, ui: &egui::Ui, text: &mut String, has_focus: bool) {
+    /// Take one key press, already translated by the front-end.
+    ///
+    /// Returns whether the press was consumed: `true` when the modal layer handled it (so the
+    /// editor widget must not see it), `false` when Insert mode leaves the key to the editor.
+    /// `changed` and `moved` describe what this single press did.
+    pub fn press(&mut self, text: &mut String, key: Key, shift: bool, ctrl: bool) -> bool {
         self.changed = false;
         self.moved = false;
-        if !has_focus {
-            return;
-        }
-        let events = ui.input(|input| input.events.clone());
-        if events.is_empty() {
-            return;
-        }
-        let insert = self.mode == Mode::Insert;
-        let prompt = self.prompt.is_some();
-        let mut keep: Vec<egui::Event> = Vec::with_capacity(events.len());
-        let mut keys: Vec<(Key, bool, bool)> = Vec::new();
-        for event in events {
-            if matches!(&event, egui::Event::Key { pressed: false, .. }) {
-                // Key releases are harmless in every mode; the TextEdit may want them.
-                keep.push(event);
-                continue;
+        if self.mode == Mode::Insert {
+            if key == Key::Escape || (ctrl && key == Key::OpenBracket) {
+                self.leave_insert(text);
+                return true;
             }
-            match event {
-                egui::Event::Key { key, repeat, modifiers, .. } => {
-                    let ctrl = modifiers.ctrl || modifiers.command;
-                    if insert {
-                        if key == Key::Escape || (ctrl && key == Key::OpenBracket) {
-                            self.leave_insert(text);
-                        } else if ctrl && key == Key::Z {
-                            self.undo(text);
-                            self.mode = Mode::Normal;
-                            self.normalize(text);
-                        } else if ctrl && (key == Key::Y || (key == Key::Z && modifiers.shift)) {
-                            self.redo(text);
-                        } else {
-                            keep.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat, modifiers });
-                        }
-                    } else {
-                        keys.push((key, modifiers.shift, ctrl));
-                    }
-                }
-                egui::Event::Text(value) => {
-                    if insert {
-                        keep.push(egui::Event::Text(value));
-                    } else if prompt {
-                        if let Some((_, line)) = &mut self.prompt {
-                            line.push_str(&value);
-                        }
-                    }
-                }
-                egui::Event::Paste(value) => {
-                    if insert {
-                        keep.push(egui::Event::Paste(value));
-                    } else if prompt {
-                        if let Some((_, line)) = &mut self.prompt {
-                            line.push_str(&value);
-                        }
-                    }
-                }
-                egui::Event::Copy | egui::Event::Cut => {
-                    if insert {
-                        keep.push(event);
-                    }
-                }
-                other => keep.push(other),
+            if ctrl && key == Key::Z {
+                self.undo(text);
+                self.mode = Mode::Normal;
+                self.normalize(text);
+                return true;
             }
+            if ctrl && (key == Key::Y || (key == Key::Z && shift)) {
+                self.redo(text);
+                return true;
+            }
+            return false;
         }
-        ui.ctx().input_mut(|input| input.events = keep);
-        for (key, shift, ctrl) in keys {
-            self.key(text, key, shift, ctrl);
+        self.key(text, key, shift, ctrl);
+        true
+    }
+
+    /// Feed typed text: the command line's characters, or a paste into it.
+    pub fn type_text(&mut self, value: &str) {
+        if let Some((_, line)) = &mut self.prompt {
+            line.push_str(value);
         }
+    }
+
+    /// Whether the last [`press`](Self::press) was taken by the modal layer.
+    pub fn captures(&self) -> bool {
+        self.mode != Mode::Insert || self.prompt.is_some()
     }
 
     fn key(&mut self, text: &mut String, key: Key, shift: bool, ctrl: bool) {
@@ -1305,9 +1350,120 @@ fn char_of(key: Key, shift: bool) -> Option<char> {
             return Some(if shift { lower.to_ascii_uppercase() } else { lower });
         }
     };
-    // egui has dedicated variants for some shifted symbols (`Colon`, `Plus`, `OpenCurlyBracket`)
-    // and plain ones for the rest; apply Shift so `>`, `_`, `"` … arrive as themselves.
+    // Some key sets have dedicated variants for shifted symbols (`Colon`, `Plus`,
+    // `OpenCurlyBracket`) and plain ones for the rest; apply Shift so `>`, `_`, `"` … arrive as
+    // themselves.
     Some(if shift { shifted(value) } else { value })
+}
+
+/// The key and Shift state a typed character stands for: the inverse of [`char_of`].
+///
+/// A front-end that only sees text (iced's `KeyPress::text`, a clipboard paste into the
+/// command line) uses this to feed the machine the same key egui's key set would have named.
+pub fn key_for_char(value: char) -> Option<(Key, bool)> {
+    if let Some(lower) = value.to_lowercase().next().filter(|lower| lower.is_ascii_lowercase()) {
+        let key = letter_key(lower.to_ascii_uppercase())?;
+        return Some((key, value.is_ascii_uppercase()));
+    }
+    if value.is_ascii_digit() {
+        return Some((digit_key(value)?, false));
+    }
+    // Both the plain and the shifted symbol of each key are accepted, so a front-end that
+    // reports either spelling lands on the same key.
+    const PAIRS: &[(char, char)] = &[('1', '!'), ('2', '@'), ('3', '#'), ('4', '$'), ('5', '%'), ('6', '^'), ('7', '&'), ('8', '*'), ('9', '('), ('0', ')'), ('-', '_'), ('=', '+'), ('[', '{'), (']', '}'), ('\\', '|'), (';', ':'), ('\'', '"'), (',', '<'), ('.', '>'), ('/', '?'), ('`', '~')];
+    let plain = match value {
+        ' ' => Some(Key::Space),
+        ':' => Some(Key::Colon),
+        ',' => Some(Key::Comma),
+        '.' => Some(Key::Period),
+        ';' => Some(Key::Semicolon),
+        '\'' => Some(Key::Quote),
+        '/' => Some(Key::Slash),
+        '\\' => Some(Key::Backslash),
+        '|' => Some(Key::Pipe),
+        '?' => Some(Key::Questionmark),
+        '!' => Some(Key::Exclamationmark),
+        '[' => Some(Key::OpenBracket),
+        ']' => Some(Key::CloseBracket),
+        '{' => Some(Key::OpenCurlyBracket),
+        '}' => Some(Key::CloseCurlyBracket),
+        '`' => Some(Key::Backtick),
+        '-' => Some(Key::Minus),
+        '+' => Some(Key::Plus),
+        '=' => Some(Key::Equals),
+        _ => None,
+    };
+    if let Some(key) = plain {
+        return Some((key, false));
+    }
+    for (base, shifted) in PAIRS {
+        if *shifted == value {
+            let key = match base {
+                '-' => Key::Minus,
+                '=' => Key::Equals,
+                '[' => Key::OpenBracket,
+                ']' => Key::CloseBracket,
+                '\\' => Key::Backslash,
+                ';' => Key::Semicolon,
+                '\'' => Key::Quote,
+                ',' => Key::Comma,
+                '.' => Key::Period,
+                '/' => Key::Slash,
+                '`' => Key::Backtick,
+                digit => digit_key(*digit)?,
+            };
+            return Some((key, true));
+        }
+    }
+    None
+}
+
+fn letter_key(upper: char) -> Option<Key> {
+    Some(match upper {
+        'A' => Key::A,
+        'B' => Key::B,
+        'C' => Key::C,
+        'D' => Key::D,
+        'E' => Key::E,
+        'F' => Key::F,
+        'G' => Key::G,
+        'H' => Key::H,
+        'I' => Key::I,
+        'J' => Key::J,
+        'K' => Key::K,
+        'L' => Key::L,
+        'M' => Key::M,
+        'N' => Key::N,
+        'O' => Key::O,
+        'P' => Key::P,
+        'Q' => Key::Q,
+        'R' => Key::R,
+        'S' => Key::S,
+        'T' => Key::T,
+        'U' => Key::U,
+        'V' => Key::V,
+        'W' => Key::W,
+        'X' => Key::X,
+        'Y' => Key::Y,
+        'Z' => Key::Z,
+        _ => return None,
+    })
+}
+
+fn digit_key(digit: char) -> Option<Key> {
+    Some(match digit {
+        '0' => Key::Num0,
+        '1' => Key::Num1,
+        '2' => Key::Num2,
+        '3' => Key::Num3,
+        '4' => Key::Num4,
+        '5' => Key::Num5,
+        '6' => Key::Num6,
+        '7' => Key::Num7,
+        '8' => Key::Num8,
+        '9' => Key::Num9,
+        _ => return None,
+    })
 }
 
 fn shifted(value: char) -> char {
@@ -1783,7 +1939,7 @@ mod tests {
         let mut vim = Vim::new();
         let mut text = "one\ntwo\nthree\n".to_string();
         vim.set_cursor(&text, 0);
-        // `>>` — `>` is shift+period in egui's key set.
+        // `>>` — `>` is shift+period in the key set.
         vim.key(&mut text, Key::Period, true, false);
         vim.key(&mut text, Key::Period, true, false);
         assert_eq!(text, "  one\ntwo\nthree\n");
@@ -1831,5 +1987,68 @@ mod tests {
         assert_eq!(text, "alpha beta");
         vim.redo(&mut text);
         assert_eq!(text, "new alpha beta");
+    }
+
+    fn press_keys(vim: &mut Vim, text: &mut String, keys: &[Key]) {
+        for key in keys {
+            vim.press(text, *key, false, false);
+        }
+    }
+
+    #[test]
+    fn normal_mode_takes_keys_and_insert_mode_leaves_typing_alone() {
+        let mut vim = Vim::new();
+        let mut text = "one two\nthree\n".to_string();
+        vim.set_cursor(&text, 0);
+        press_keys(&mut vim, &mut text, &[Key::W]);
+        assert_eq!(vim.cursor(), 4, "w moves a word");
+        assert!(vim.press(&mut text, Key::I, false, false), "i is consumed by the modal layer");
+        assert_eq!(vim.mode, Mode::Insert);
+        assert!(!vim.press(&mut text, Key::A, false, false), "letters are the editor's in Insert mode");
+        assert!(vim.press(&mut text, Key::Escape, false, false), "Escape is the modal layer's again");
+        assert_eq!(vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_command_typed_on_the_command_line_reaches_the_window() {
+        let mut vim = Vim::new();
+        let mut text = "= Title\n".to_string();
+        press_keys(&mut vim, &mut text, &[Key::Colon]);
+        assert_eq!(vim.prompt(), Some((':'.into(), "")));
+        for value in ["w", "q"] {
+            vim.type_text(value);
+        }
+        press_keys(&mut vim, &mut text, &[Key::Enter]);
+        assert_eq!(vim.request, Some(Request::Save));
+        assert_eq!(vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn dd_removes_one_line_and_leaves_the_rest() {
+        let mut vim = Vim::new();
+        let mut text = "a\nb\nc\n".to_string();
+        vim.set_cursor(&text, 2);
+        press_keys(&mut vim, &mut text, &[Key::D, Key::D]);
+        assert_eq!(text, "a\nc\n");
+        assert!(vim.changed);
+        // `u` restores it: the undo stack is the vim layer's own, in both front-ends.
+        press_keys(&mut vim, &mut text, &[Key::U]);
+        assert_eq!(text, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn a_typed_character_maps_back_to_the_key_that_produced_it() {
+        assert_eq!(key_for_char('g'), Some((Key::G, false)));
+        assert_eq!(key_for_char('G'), Some((Key::G, true)));
+        assert_eq!(key_for_char('>'), Some((Key::Period, true)));
+        assert_eq!(key_for_char('.'), Some((Key::Period, false)));
+        assert_eq!(key_for_char(':'), Some((Key::Colon, false)));
+        assert_eq!(key_for_char('7'), Some((Key::Num7, false)));
+        assert_eq!(key_for_char(' '), Some((Key::Space, false)));
+        // The round trip is the property the front-ends rely on.
+        for value in [Key::A, Key::Period, Key::Colon, Key::Num3, Key::Slash] {
+            let ch = char_of(value, false).unwrap();
+            assert_eq!(key_for_char(ch), Some((value, false)), "{value:?} round-trips");
+        }
     }
 }

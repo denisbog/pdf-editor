@@ -9,12 +9,11 @@ use egui::text_selection::CCursorRange;
 use egui::{Align2, Color32, FontId, Rect, Stroke, TextEdit, Ui, pos2, vec2};
 use typst::syntax::{SyntaxKind, SyntaxNode};
 
-use crate::theme::Tokens;
-use crate::vim::{self, Vim};
+use pdf_editor_core::document::Mark;
+use pdf_editor_core::vim::{self, Vim};
 
-/// How long after the last keystroke the document is typeset again. The page view is meant to
-/// settle once you stop typing, not to follow every word.
-pub const DEBOUNCE: f64 = 0.6;
+use crate::theme::Tokens;
+
 /// Height of the command line (`:w`, `/pattern`) drawn at the bottom of the pane.
 const PROMPT_HEIGHT: f32 = 26.0;
 /// Room above the first line and below the last, so the caret never sits on the edge.
@@ -71,18 +70,6 @@ pub struct EditorOutput {
     pub changed: bool,
     /// A command the command line asked the window for (`:w`, `:q`, `:e`).
     pub request: Option<vim::Request>,
-}
-
-/// A diagnostic's place in the buffer: a line, and the run of characters on it to underline.
-#[derive(Clone, Debug)]
-pub struct Mark {
-    /// 0-based line.
-    pub line: usize,
-    /// 0-based column in characters from the line's start.
-    pub column: usize,
-    /// How many characters the diagnostic covers (at least one).
-    pub len: usize,
-    pub error: bool,
 }
 
 pub struct Editor {
@@ -211,7 +198,7 @@ impl Editor {
         // mode only Escape and the undo keys.
         let mut request = None;
         if owns {
-            self.vim.handle(ui, &mut self.text, true);
+            crate::vim_input::handle(&mut self.vim, ui, &mut self.text, true);
             request = self.vim.request.take();
             if !focused {
                 ui.memory_mut(|memory| memory.request_focus(id));
@@ -699,8 +686,10 @@ mod tests {
     #[test]
     fn a_wrapped_line_maps_to_its_first_row_and_takes_its_rows_together() {
         let ctx = egui::Context::default();
-        // egui only has fonts after a pass has run.
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        // egui only has fonts after a pass has run. The pass's texture deltas have to be
+        // consumed (they cannot be dropped unapplied), so clear them right away.
+        let mut first = ctx.run_ui(egui::RawInput::default(), |_| {});
+        first.textures_delta.clear();
         let mut job = LayoutJob::default();
         job.wrap.max_width = 60.0;
         job.append(

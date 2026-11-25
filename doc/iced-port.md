@@ -1,7 +1,58 @@
 # Task: move the window layer from egui to iced
 
-Status: **planned, not started.** This is the work plan for a later session. The app stays on
-egui/eframe until an iced front-end reaches parity; nothing here is a rewrite in place.
+Status: **implemented** (November 2026). The plan below is kept as written, with the result
+recorded in ["What landed"](#what-landed) and in the amended phases and acceptance runs. The
+egui binary still exists and still works: the port was additive, as planned.
+
+Two binaries now share one core:
+
+```
+pdf-editor/            (workspace)
+├── crates/core/       engine + vim + document model (no UI types)
+├── crates/egui-app/   pdf-editor       — the original shell
+└── crates/iced-app/   pdf-editor-iced  — the new shell
+```
+
+## What landed
+
+| Plan | What was built |
+| --- | --- |
+| Step 0: `crates/core` with `engine/` and `vim.rs`, plus a `Source` trait | Done. `crates/core` holds `engine/` (compile thread, raster pool, glyph index), `vim.rs`, `source.rs` (`Source`, `Edit`, `Buffer`) and `document.rs` (settings/session, theme kinds, diagnostic marks, paths). |
+| `egui::Context` in the engine → wake callback | Done: `engine::Waker` (an `Arc<dyn Fn()>`); egui passes `request_repaint`, iced passes nothing and polls, the CLI passes `Waker::none()`. |
+| vim speaks the same code in both front-ends | Done. `vim.rs` lost its `egui::Key`/`Ui` coupling: it has a toolkit-neutral `Key` (with `key_for_char` as the inverse of `char_of` for front-ends that only see text) and public `press`/`type_text`. Both shells feed it; the egui event-queue filter is now `crates/egui-app/src/vim_input.rs`. |
+| vim mutates a `String`; the iced editor takes `Action`s | Done differently, and cheaper: the iced adapter keeps the editor's text as a mirror and turns each command's mutation into the single contiguous difference (`Action::Replace`) plus `MoveTo`/`SelectTo`. Every vim command is a contiguous edit, so one `Replace` is enough; `crates/iced-app/src/vim.rs` tests the diff and the `dd`/Visual cases. |
+| Page view: raster handles, spread, zoom anchor, fit-to-width | Done with plain widgets: `scrollable` + rows of `image::Handle` pages with container shadows; `pages.rs` carries the egui geometry (spread, gaps, margins) as `f32`s. Scroll tracking comes from `Scrollable::on_scroll` and jumps from `operation::scroll_to`. |
+| Click-to-source becomes exact | Done: the compile indexes every glyph's source byte (`Glyph`), so `engine::position_at` returns `(line, column)`; a click on "Notes" lands on `11:31` rather than the start of line 11. |
+| Diagnostics through `Content::set_diagnostics` | Done: `document::diagnostic_ranges` hands byte ranges (and messages) to the editor; the squiggles are the widget's, the line wash and gutter colours are ours. |
+| Chrome on iced widgets | Done: one `tab strip` and one `mode bar` built from `row`/`button`/`container`, both rails, `Problems`/`Document`/`Log` panels, palette/toasts/shortcuts/unsaved-changes overlays via `stack`, `svg` icons from the same Lucide set. |
+| Resizable splits | Done by hand rather than with `pane_grid`: a 6 px grip (the plan's "grip gap") starts a drag, and global cursor events apply the delta to the split ratio or the panel width — the same pixels the egui build drags. |
+| Settings/session | One JSON file for both shells (`~/.config/pdf-editor/settings.json`, `PDF_EDITOR_SETTINGS` overrides): zoom, theme, view, split and side width, vim on/off, session tabs. eframe's storage is no longer used. |
+| Undo granularity (the known gap) | Not needed: the shared vim machine keeps its own snapshots, so one insert session is one `u`, in both shells. The editor's own history still records the `Replace`s for Insert-mode `Ctrl+Z`. |
+| Redraw model | Waker is idle; the iced heartbeat (`iced::time::every`) only exists while work is in flight or a toast is fading, so an idle window asks for no frames. |
+
+A later pass rebuilt the window on the `rust-iced-desktop-ui` design system: one token module
+(colours, chrome metrics, the Inter face registered as "Inter Variable"), one `widgets.rs`
+vocabulary for every button/tab/row/panel/overlay, a 40 px panel shell with a close control,
+scrim-backed palette/shortcuts/dialog layers that close on click-away, `Esc` priority and
+shortcut gating while an overlay is open, tooltips on icon-only controls, `on_press_maybe`
+disabled states, indicator dots on closed panels that have content, and one 7 px scrollbar
+everywhere. The source/pages split is driven by one `split_widths()` (source `Fixed`, pages
+`Fill`, clamped minimum) so the grip drags at the ratio the page geometry uses. The skill grew
+two pitfalls (a divider that cannot move because both panes are `Fill`; a fixed SVG squeezed
+inside `center_y` next to a fixed-width scrollable) and a `drag.py` helper for press→move→release
+tests. `scripts/ui-lint.sh` from that skill now reports no structural hits for
+`crates/iced-app/src`.
+
+The raster queue is declarative (every visible, unsatisfied page, in-flight ones included with
+their tag), so replacing the pool's queue cannot drop a request that is still being rendered —
+that bug made the page view keep its old pixels after an edit. The same fix went into the egui
+build, which had the same "only new requests" pattern.
+
+Not carried over: accessibility (iced has no accesskit), the debug CLI (it stays in `pdf-editor`),
+and the egui-specific IME and caret workarounds (the iced editor owns pre-edit and the caret; it
+was checked by typing, see the acceptance run). The source pane takes the keyboard on the first
+click rather than on launch: `CodeEditor` exposes no widget id, and iced's `operation::focus`
+needs one, so there is no autofocus hook to call.
 
 ## Why consider it at all
 
@@ -151,15 +202,15 @@ The viewer is the app's identity; it is also the part with no ready-made widget.
 
 Estimates are for one focused developer; each phase ends with a runnable app.
 
-| Phase | Work | Size |
-| --- | --- | --- |
-| 0 | Extract `crates/core` (engine + `vim.rs` + `Source` trait); egui app keeps working on it | 1–2 days |
-| 1 | Spike `crates/iced-app`: `typst-iced-editor` pane, compile thread, one page image, click-to-source. No chrome. **This is the go/no-go gate.** | 1–2 days |
-| 2 | Page view: pasteboard, spread, zoom/scroll anchor, fit-to-width, raster handles | 2–3 days |
-| 3 | Chrome: tab strip, mode bar, rails, split with grip, panels, palette, toasts, dialogs | 3–5 days |
-| 4 | Settings/session persistence, export, open/new/save, shortcuts | 1 day |
-| 5 | Vim adapter on `key_binding`/`Action`; parity checklist below | 2–3 days |
-| 6 | Polishing: theme parity, icons, accessibility notes, screenshots, README | 1 day |
+| Phase | Work | Size | Status |
+| --- | --- | --- | --- |
+| 0 | Extract `crates/core` (engine + `vim.rs` + `Source` trait); egui app keeps working on it | 1–2 days | done |
+| 1 | Spike `crates/iced-app`: `typst-iced-editor` pane, compile thread, one page image, click-to-source. No chrome. **This is the go/no-go gate.** | 1–2 days | done (gate passed) |
+| 2 | Page view: pasteboard, spread, zoom/scroll anchor, fit-to-width, raster handles | 2–3 days | done |
+| 3 | Chrome: tab strip, mode bar, rails, split with grip, panels, palette, toasts, dialogs | 3–5 days | done |
+| 4 | Settings/session persistence, export, open/new/save, shortcuts | 1 day | done |
+| 5 | Vim adapter on `key_binding`/`Action`; parity checklist below | 2–3 days | done |
+| 6 | Polishing: theme parity, icons, accessibility notes, screenshots, README | 1 day | done, minus accessibility (not available on iced) |
 
 Total ≈ 10–15 days to parity, versus "keep improving the egui app" at ~0 incremental risk.
 
@@ -176,6 +227,23 @@ Run in the headless KWin session (`desktop-app-linux` skill), with `doc/demo.typ
 5. An Arabic/Hebrew line in the source renders in visual order (this is the whole reason to
    consider iced; if it does not, the port has no justification).
 6. Idle CPU under 5% with a document open; no continuous redraw.
+
+**Result (run in the headless KWin session):**
+
+| # | Observed |
+| --- | --- |
+| 1 | Typing in Insert mode keeps the caret with the text; the source is coloured on every frame (the editor re-shapes from its own buffer, so there is no stale-layout frame). |
+| 2 | Long comment lines and the `#set …` lines soft-wrap; the gutter numbers one logical line on its first row; the current-line band covers the wrapped rows. |
+| 3 | Clicking "Notes on a Page Editor" on the page moved the caret to `11:31` — the line *and* the column of the word under the pointer. Clicking `= Why a page editor` moved it to `28:3`. |
+| 4 | An accidental edit inside `leading:` produced a squiggle under the broken span and an error in the mode bar after the 0.6 s debounce; `Content::set_diagnostics` was fed from the compile's byte ranges. |
+| 5 | An Arabic/Hebrew test document renders in visual, shaped order in the iced pane; the same file in the egui pane draws boxes in logical order (`doc/bidi-*.png`). |
+| 6 | `top` over 9 s of idleness: 0.3–1.0% CPU, no frames requested (the heartbeat subscription is absent when nothing is in flight). |
+
+Jank observed on the way, all in the shell rather than the engine: the editor's `line_height`
+takes an iced `Pixels` value (`Pixels(17.5)`), not a bare `f32`, which is a *relative* factor —
+passing 17.5 turned one row into 218 px and made the current-line wash cover the pane; and the
+page click must not divide the mouse area's local point by the zoom twice (the widget's `on_move`
+reports page-local pixels; the shell converts them once).
 
 ## Lessons that must survive the port
 

@@ -6,13 +6,15 @@
 //! that turns a `PagedDocument` into page textures at whatever zoom the view asks for.
 
 mod compile;
+mod wake;
 mod world;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Condvar, Mutex};
 
-pub use compile::{compile, line_at, Compiler, Diagnostic, Event, Hit, Outcome, PageMeta};
+pub use compile::{compile, line_at, position_at, Compiler, Diagnostic, Event, Glyph, Hit, Outcome, PageMeta};
+pub use wake::Waker;
 pub use world::{fonts, fonts_ready, warm_fonts};
 
 use typst_layout::PagedDocument;
@@ -66,16 +68,16 @@ const MAX_SCALE: f32 = 3.0;
 const MAX_PIXELS: f32 = 24_000_000.0;
 
 impl RasterPool {
-    pub fn new(ctx: egui::Context, threads: usize) -> Self {
+    pub fn new(waker: Waker, threads: usize) -> Self {
         let shared = Arc::new(Shared { state: Mutex::new(State { document: None, gen: 0, queue: Vec::new(), running: true }), wake: Condvar::new() });
         let (tx, done) = channel::<RasterDone>();
         for index in 0..threads.max(1) {
             let shared = shared.clone();
             let tx: Sender<RasterDone> = tx.clone();
-            let ctx = ctx.clone();
+            let waker = waker.clone();
             std::thread::Builder::new()
                 .name(format!("typst-raster-{index}"))
-                .spawn(move || raster_thread(shared, tx, ctx))
+                .spawn(move || raster_thread(shared, tx, waker))
                 .expect("a raster thread starts");
         }
         Self { shared, done, next_tag: Arc::new(AtomicU64::new(1)) }
@@ -116,7 +118,7 @@ impl RasterPool {
     }
 }
 
-fn raster_thread(shared: Arc<Shared>, done: Sender<RasterDone>, ctx: egui::Context) {
+fn raster_thread(shared: Arc<Shared>, done: Sender<RasterDone>, waker: Waker) {
     loop {
         let (gen, document, task) = {
             let mut state = shared.state.lock().unwrap();
@@ -132,7 +134,7 @@ fn raster_thread(shared: Arc<Shared>, done: Sender<RasterDone>, ctx: egui::Conte
         };
         let raster = render_page(&document, gen, task);
         let _ = done.send(raster);
-        ctx.request_repaint();
+        waker.wake();
     }
 }
 

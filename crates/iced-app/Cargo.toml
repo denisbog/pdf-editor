@@ -1,0 +1,30 @@
+[package]
+name = "pdf-editor-iced"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PDF Editor on iced: the same Typst engine and vim machine, with a bidi-capable code editor"
+
+[[bin]]
+name = "pdf-editor-iced"
+path = "src/main.rs"
+
+[dependencies]
+pdf-editor-core = { path = "../core" }
+typst.workspace = true
+typst-layout.workspace = true
+typst-pdf.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lucide-static-svg.workspace = true
+damascene-fonts-inter.workspace = true
+damascene-fonts-jetbrains-mono.workspace = true
+
+# `typst-iced-editor` draws its fold markers and diagnostic squiggles through iced's SVG
+# pipeline, so the `svg` feature is not optional; `image` is for the page rasters.
+# `tokio` brings `iced::time::every`, the heartbeat that polls the compile and raster threads.
+iced = { version = "0.14", features = ["svg", "image", "advanced", "tokio"] }
+typst-iced-editor = "0.2"

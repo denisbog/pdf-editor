@@ -5,17 +5,19 @@
 //! typing stays responsive; a click on a page puts the caret on the line that set the text
 //! under the pointer, which is what makes the page view feel editable rather than a preview.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui::{Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use typst_layout::PagedDocument;
 
-use crate::editor::{self, Editor};
-use crate::engine::{self, Compiler, Diagnostic, Event, PageMeta, RasterPool, Task};
+use pdf_editor_core::document::{self, marks_for, shorten, target_path, unique_path, RightPanel, SessionDoc, Settings, ThemeKind, ThemePreference, View, WELCOME};
+use pdf_editor_core::engine::{self, Compiler, Diagnostic, Event, PageMeta, RasterPool, Task, Waker};
+use pdf_editor_core::vim;
+
+use crate::editor::Editor;
 use crate::icons;
-use crate::theme::{self, ThemeKind, ThemePreference, Tokens};
-use crate::vim;
+use crate::theme::{self, Tokens};
 use crate::widgets;
 
 const PAGE_GAP: f32 = 20.0;
@@ -28,7 +30,6 @@ const ZOOM_STEPS: [f32; 17] = [0.1, 0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.25, 1.5,
 /// Space above the first page and below the last, for the drop shadow.
 const SCROLL_MARGIN: f32 = 22.0;
 /// Width of a right-hand panel (Problems, Document, Log), and the range a drag can give it.
-const SIDE_WIDTH: f32 = 312.0;
 const SIDE_MIN: f32 = 240.0;
 const SIDE_MAX: f32 = 640.0;
 /// The narrowest either side of the source/pages split may become, and the width of the grip
@@ -36,97 +37,7 @@ const SIDE_MAX: f32 = 640.0;
 const SOURCE_MIN: f32 = 240.0;
 const GRIP: f32 = 3.0;
 
-const WELCOME: &str = r#"#set page(paper: "a4", margin: (x: 2.4cm, y: 2.5cm))
-#set text(font: "Libertinus Serif", size: 11pt)
-#set par(justify: true, leading: 0.68em)
-#set heading(numbering: "1.1")
 
-#align(center)[
-  #text(18pt, weight: "bold")[Untitled]
-  #v(6pt)
-  #text(10pt, fill: luma(120))[A document set with Typst]
-]
-
-= Start writing
-
-The text on the left is the whole document. Every edit is typeset again into the pages on
-the right, and *Export PDF* writes exactly what you see — no separate compile step.
-
-== What this editor does
-
-- The page view is the typeset document, not a separate preview.
-- Click a word on a page and the caret goes to the line that set it.
-- Mistakes are listed in the *Problems* panel, with the line they belong to.
-
-#table(
-  columns: 2,
-  [*Feature*], [*Where*],
-  [Compile], [Ctrl+R],
-  [Export PDF], [Ctrl+E],
-  [Save], [Ctrl+S],
-)
-"#;
-
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub enum View {
-    Source,
-    #[default]
-    Split,
-    Preview,
-}
-
-impl View {
-    fn label(self) -> &'static str {
-        match self {
-            View::Source => "Source",
-            View::Split => "Split",
-            View::Preview => "Preview",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RightPanel {
-    Problems,
-    Document,
-    Log,
-}
-
-/// A document to reopen on the next launch, and the page the editor was on.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct SessionDoc {
-    pub path: PathBuf,
-    pub page: usize,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct Settings {
-    pub zoom: f32,
-    pub theme: ThemePreference,
-    pub view: View,
-    /// Modal (Vim) editing in the source pane.
-    pub vim: bool,
-    /// Keep the pages fitted to the band as it changes (until a zoom is chosen).
-    #[serde(default = "default_fit")]
-    pub fit_width: bool,
-    /// The source pane's share of the band in Split view (0.2..=0.8).
-    pub split: f32,
-    /// The width of the Problems/Document/Log panel, in points.
-    pub side_width: f32,
-    pub session: Vec<SessionDoc>,
-    pub session_active: usize,
-}
-
-fn default_fit() -> bool {
-    true
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self { zoom: 1.0, theme: ThemePreference::Light, view: View::Split, vim: true, fit_width: true, split: 0.44, side_width: SIDE_WIDTH, session: Vec::new(), session_active: 0 }
-    }
-}
 
 /// A document command raised inside a pass, when `self.docs` is out of the window.
 enum PendingAction {
@@ -308,10 +219,17 @@ impl App {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         theme::install_fonts(&cc.egui_ctx);
-        let settings = cc.storage.and_then(|storage| eframe::get_value::<Settings>(storage, eframe::APP_KEY)).unwrap_or_default();
-        let kind = settings.theme.resolve(cc.egui_ctx.system_theme(), ThemeKind::Light);
+        // The settings file is shared with the iced build (and with the CLI hooks): eframe's
+        // own storage is not used any more.
+        let settings = document::load_settings();
+        let system_dark = cc.egui_ctx.system_theme().map(|theme| theme == egui::Theme::Dark);
+        let kind = settings.theme.resolve(system_dark, ThemeKind::Light);
         theme::apply(&cc.egui_ctx, kind);
-        let rasters = RasterPool::new(cc.egui_ctx.clone(), render_threads());
+        let waker = Waker::new({
+            let ctx = cc.egui_ctx.clone();
+            move || ctx.request_repaint()
+        });
+        let rasters = RasterPool::new(waker.clone(), render_threads());
         let mut app = Self {
             docs: Vec::new(),
             active: None,
@@ -319,7 +237,7 @@ impl App {
             next_gen: 1,
             settings,
             kind,
-            compiler: Compiler::spawn(cc.egui_ctx.clone()),
+            compiler: Compiler::spawn(waker.clone()),
             rasters,
             pending_open: None,
             pending_close: None,
@@ -340,7 +258,7 @@ impl App {
         };
         app.view = app.settings.view;
         if app.fonts_pending {
-            engine::warm_fonts(Some(cc.egui_ctx.clone()));
+            engine::warm_fonts(Some(waker.clone()));
         }
         // Files named on the command line win; otherwise reopen the last session's documents.
         let named: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).filter(|path| path.is_file()).collect();
@@ -592,7 +510,7 @@ impl App {
         let mut compile: Vec<u64> = Vec::new();
         for doc in &self.docs {
             if let Some(at) = doc.edited_at {
-                if now - at > editor::DEBOUNCE {
+                if now - at > document::DEBOUNCE {
                     compile.push(doc.id);
                 }
             }
@@ -726,7 +644,7 @@ impl App {
         let t = Tokens::get(ctx);
         egui::Panel::top("tab_strip")
             .exact_size(38.0)
-            .frame(Frame::NONE.fill(t.titlebar).inner_margin(Margin { left: 8, right: 10, top: 0, bottom: 0 }))
+            .frame(Frame::NONE.fill(t.titlebar).inner_margin(Margin { left: 10, right: 10, top: 0, bottom: 0 }))
             .show(ui, |ui| {
                 let full = ui.max_rect();
                 let drag = ui.interact(full, ui.id().with("title_drag"), Sense::click_and_drag());
@@ -743,7 +661,7 @@ impl App {
                         self.active = None;
                     }
                     let tabs_width = (ui.available_width() - 260.0).max(120.0);
-                    egui::ScrollArea::horizontal().id_salt("document_tabs").max_width(tabs_width).auto_shrink([false, true]).show(ui, |ui| {
+                    egui::ScrollArea::horizontal().id_salt("document_tabs").max_width(tabs_width).auto_shrink([true, true]).show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             let mut show = None;
@@ -768,8 +686,16 @@ impl App {
                     if widgets::ghost_button(ui, "plus", "New").on_hover_text("New document (Ctrl+N)").clicked() {
                         self.new_document(ctx);
                     }
+                    // Pushed right-to-left, so the theme button ends up leftmost of the three:
+                    // the same order as the iced tab strip (theme, help, about).
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
+                        if icons::button(ui, "info", 28.0, false, "About").clicked() {
+                            self.toast("PDF Editor — a Typst document, typeset page by page");
+                        }
+                        if icons::button(ui, "circle-help", 28.0, false, "Keyboard shortcuts").clicked() {
+                            self.shortcuts = true;
+                        }
                         let icon = self.settings.theme.icon();
                         let other = match self.kind {
                             ThemeKind::Light => "dark gray",
@@ -781,12 +707,6 @@ impl App {
                                 ThemeKind::Light => ThemePreference::Dark,
                                 ThemeKind::Dark => ThemePreference::Light,
                             };
-                        }
-                        if icons::button(ui, "circle-help", 28.0, false, "Keyboard shortcuts").clicked() {
-                            self.shortcuts = true;
-                        }
-                        if icons::button(ui, "info", 28.0, false, "About").clicked() {
-                            self.toast("PDF Editor — a Typst document, typeset page by page");
                         }
                     });
                 });
@@ -808,14 +728,10 @@ impl App {
                             self.view = view;
                         }
                     }
+                    // Right cluster, pushed right-to-left: status (rightmost), zoom, then the
+                    // palette box — the same order and the same 10 pt gutter as the tab strip.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        if widgets::search_box(ui, "Find a command", 180.0).clicked() {
-                            self.palette = true;
-                            self.palette_focus = true;
-                        }
-                        ui.add_space(4.0);
-                        self.zoom_button(ui);
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         if let Some(doc) = self.doc() {
                             let (label, color) = status_of(doc, self.fonts_pending);
                             let response = ui.add(
@@ -826,6 +742,11 @@ impl App {
                             if response.on_hover_text("Compile status — click for the Problems panel").clicked() {
                                 self.right = Some(RightPanel::Problems);
                             }
+                        }
+                        self.zoom_button(ui);
+                        if widgets::search_box(ui, "Find a command", 232.0).clicked() {
+                            self.palette = true;
+                            self.palette_focus = true;
                         }
                     });
                 });
@@ -1051,7 +972,7 @@ impl App {
                         // The document list is out of the window for this pass, so the command
                         // waits until the pass is over.
                         self.pending_actions.push(match request {
-                            vim::Request::Save => PendingAction::Save(doc.id),
+                            pdf_editor_core::vim::Request::Save => PendingAction::Save(doc.id),
                             vim::Request::Close => PendingAction::Close(doc.id),
                             vim::Request::Open(path) => PendingAction::Open(PathBuf::from(path)),
                             vim::Request::Compile => PendingAction::Compile(doc.id),
@@ -1240,14 +1161,23 @@ impl App {
                 painter.rect_stroke(page_rect, CornerRadius::ZERO, Stroke::new(0.5, t.border.gamma_multiply(0.8)), StrokeKind::Outside);
 
                 if visible && doc.shown_gen != 0 {
-                    if let Some(slot) = doc.pages.get(page) {
+                    // The list handed to the pool is declarative: every visible page that is not
+                    // satisfied is in it, including the ones already in flight (with their tag).
+                    // Sending only the new ones replaces the pool's queue and drops requests that
+                    // are still being rendered, leaving those pages pending for ever.
+                    if let Some(slot) = doc.pages.get_mut(page) {
                         let satisfied = slot.texture.is_some() && (slot.scale - scale).abs() < 0.01 && slot.gen == doc.shown_gen;
-                        let pending = slot.pending.is_some_and(|(_, pending_scale)| (pending_scale - scale).abs() < 0.01);
-                        if !satisfied && !pending {
-                            let tag = self.rasters.tag();
-                            if let Some(slot) = doc.pages.get_mut(page) {
-                                slot.pending = Some((tag, scale));
-                            }
+                        if satisfied {
+                            slot.pending = None;
+                        } else {
+                            let tag = match slot.pending {
+                                Some((tag, pending_scale)) if (pending_scale - scale).abs() < 0.01 => tag,
+                                _ => {
+                                    let tag = self.rasters.tag();
+                                    slot.pending = Some((tag, scale));
+                                    tag
+                                }
+                            };
                             tasks.push(Task { page, scale, tag });
                         }
                     }
@@ -1255,6 +1185,7 @@ impl App {
                     if let Some(slot) = doc.pages.get_mut(page) {
                         slot.texture = None;
                         slot.scale = 0.0;
+                        slot.pending = None;
                     }
                 }
 
@@ -1533,7 +1464,8 @@ impl eframe::App for App {
         if let Some(path) = self.pending_open.take() {
             self.open(path, &ctx, None);
         }
-        let kind = self.settings.theme.resolve(ctx.system_theme(), ThemeKind::Light);
+        let system_dark = ctx.system_theme().map(|theme| theme == egui::Theme::Dark);
+        let kind = self.settings.theme.resolve(system_dark, ThemeKind::Light);
         if kind != self.kind {
             theme::apply(&ctx, kind);
             self.kind = kind;
@@ -1723,11 +1655,11 @@ impl eframe::App for App {
         }
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
         self.settings.session = self.docs.iter().filter(|doc| doc.saved.is_some()).map(|doc| SessionDoc { path: doc.path.clone(), page: doc.page }).collect();
         self.settings.session_active = self.docs.iter().position(|doc| Some(doc.id) == self.active).unwrap_or(0);
         self.settings.view = self.view;
-        eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+        document::save_settings(&self.settings);
     }
 
     fn auto_save_interval(&self) -> std::time::Duration {
@@ -1889,36 +1821,6 @@ fn log_panel(ui: &mut egui::Ui, compiler: &Compiler) {
     });
 }
 
-/// Turn the compile's diagnostics into marks for the editor: which line, which column, how many
-/// characters to underline. Ranges are byte offsets into `text`; anything that points into an
-/// included file is left out (there is no line in this buffer for it).
-fn marks_for(text: &str, diagnostics: &[Diagnostic]) -> Vec<editor::Mark> {
-    let starts: Vec<usize> = std::iter::once(0).chain(text.match_indices('\n').map(|(index, _)| index + 1)).collect();
-    let mut marks = Vec::new();
-    for diagnostic in diagnostics {
-        if diagnostic.file.is_some() {
-            continue;
-        }
-        let (line, column, len) = match &diagnostic.range {
-            Some(range) => {
-                let start = range.start.min(text.len());
-                let end = range.end.clamp(start, text.len());
-                let line = starts.partition_point(|&offset| offset <= start).saturating_sub(1);
-                let line_begin = starts.get(line).copied().unwrap_or(0);
-                let line_end = text[line_begin..].find('\n').map_or(text.len(), |offset| line_begin + offset);
-                let column = text[line_begin..start].chars().count();
-                let covered = text[start..end.min(line_end)].chars().count().max(1);
-                (line, column, covered)
-            }
-            // A diagnostic without a span (an included file's error, a detached one) still has a
-            // line and column: mark the single character there.
-            None => (diagnostic.line, diagnostic.column, 1),
-        };
-        marks.push(editor::Mark { line, column, len, error: diagnostic.is_error() });
-    }
-    marks
-}
-
 /// Drop the empty IME pre-edit events some compositors send with every frame. egui repaints
 /// immediately whenever the frame carries any event, so a steady trickle of "pre-edit: nothing"
 /// keeps the window redrawing at the refresh rate - and the editor shimmering with it. An empty
@@ -1931,16 +1833,6 @@ fn drop_noisy_ime(ui: &egui::Ui) {
         return;
     }
     ui.ctx().input_mut(|input| input.events.retain(|event| !empty_preedit(event)));
-}
-
-/// Shorten a label to `max` characters, marking the cut with an ellipsis.
-fn shorten(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut short: String = text.chars().take(max.saturating_sub(1)).collect();
-    short.push('…');
-    short
 }
 
 /// The compile status in the mode bar and the source header.
@@ -1967,38 +1859,6 @@ fn status_of(doc: &Doc, fonts_pending: bool) -> (String, Color32) {
 
 fn render_threads() -> usize {
     std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4).clamp(1, 6)
-}
-
-/// Where a save or export goes: the folder named by `variable` when it is set (a hook for
-/// scripted runs, where a native file dialog would block), else a dialog.
-fn target_path(document: &Path, variable: &str, extension: &str) -> Option<PathBuf> {
-    if let Ok(folder) = std::env::var(variable) {
-        let name = document.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_else(|| "document".to_string());
-        return Some(Path::new(&folder).join(format!("{name}.{extension}")));
-    }
-    let name = document.with_extension(extension).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| format!("document.{extension}"));
-    let mut dialog = rfd::FileDialog::new().add_filter(extension.to_uppercase(), &[extension]).set_file_name(name);
-    if let Some(folder) = document.parent() {
-        dialog = dialog.set_directory(folder);
-    }
-    let Some(path) = dialog.save_file() else { return None };
-    Some(if path.extension().is_some() { path } else { path.with_extension(extension) })
-}
-
-fn unique_path(folder: &Path, name: &str, taken: &[PathBuf]) -> PathBuf {
-    let free = |path: &Path| !path.exists() && !taken.iter().any(|other| other == path);
-    let base = folder.join(name);
-    if free(&base) {
-        return base;
-    }
-    let stem = Path::new(name).file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled".to_string());
-    for index in 2..1000 {
-        let candidate = folder.join(format!("{stem}-{index}.typ"));
-        if free(&candidate) {
-            return candidate;
-        }
-    }
-    base
 }
 
 fn anchor_under(doc: &Doc, screen: Pos2, viewport_top: f32) -> Option<(usize, f32, f32)> {
@@ -2049,48 +1909,4 @@ fn nearest_hit(meta: &PageMeta, x: f32, y: f32) -> Option<engine::Hit> {
         }
     }
     best.filter(|(distance, _)| *distance < 900.0).map(|(_, hit)| hit)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use typst::diag::Severity;
-
-    fn diagnostic(severity: Severity, range: Option<std::ops::Range<usize>>, line: usize, column: usize) -> Diagnostic {
-        Diagnostic { severity, message: String::new(), hints: Vec::new(), line, column, file: None, range }
-    }
-
-    #[test]
-    fn shorten_marks_the_cut() {
-        assert_eq!(shorten("demo.typ", 20), "demo.typ");
-        assert_eq!(shorten("a-very-long-document-name.typ", 10), "a-very-lo…");
-    }
-
-    #[test]
-    fn marks_carry_line_column_and_length() {
-        let text = "= Title\n\nSome #bad() here\n";
-        let bad = text.find("#bad").unwrap();
-        let marks = marks_for(text, &[diagnostic(Severity::Error, Some(bad..bad + 4), 2, 5)]);
-        assert_eq!(marks.len(), 1);
-        assert_eq!((marks[0].line, marks[0].column, marks[0].len), (2, 5, 4));
-        assert!(marks[0].error);
-    }
-
-    #[test]
-    fn a_warning_is_marked_as_one_and_a_span_across_lines_is_clamped() {
-        let text = "first line\nsecond\n";
-        let start = text.find("line").unwrap();
-        // Ran to the end of the buffer: the mark stops at this line's newline.
-        let marks = marks_for(text, &[diagnostic(Severity::Warning, Some(start..text.len()), 0, 6)]);
-        assert_eq!((marks[0].line, marks[0].column, marks[0].len), (0, 6, 4));
-        assert!(!marks[0].error);
-    }
-
-    #[test]
-    fn a_diagnostic_in_an_included_file_is_left_out() {
-        let text = "= Title\n";
-        let mut other = diagnostic(Severity::Error, Some(0..2), 0, 0);
-        other.file = Some("chapter.typ".to_string());
-        assert!(marks_for(text, &[other]).is_empty());
-    }
 }
