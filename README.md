@@ -18,8 +18,8 @@ it, and **Export PDF** writes exactly the pages on screen.
 ```
 
 The chrome — tab strip, mode bar, tool rails, panels, pasteboard, colour palette, Inter
-typeface and Lucide icons — is [`../pdf-translate`](../pdf-translate)'s, which is PdfCraft's
-(`crates/ui-egui`), so the three apps read as one family. What changes is the engine: pages
+typeface and Lucide icons — is the `pdf-translate` app's (a sibling project on this machine),
+which is PdfCraft's (`crates/ui-egui`), so the three apps read as one family. What changes is the engine: pages
 come from the Typst compiler instead of from a PDF file.
 
 ## Before building this: does such an app already exist?
