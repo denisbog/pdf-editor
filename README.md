@@ -217,6 +217,12 @@ result as an egui texture. A request whose page left the screen is replaced, not
 **Export.** The same `PagedDocument` is handed to the compile thread, which writes it with
 `typst-pdf` — so the PDF cannot differ from what was on screen.
 
+**Moving the window layer to iced** is planned but deferred: the engine, the page view's data and
+the vim state machine are toolkit-independent, and iced's text shaping (bidi, complex scripts) and
+its modal `key_binding` hook are the two things egui cannot offer. The inventory, the adapter
+design for vim, the phases and the acceptance tests are written down in
+[doc/iced-port.md](doc/iced-port.md).
+
 ## Notes and limitations
 
 * **A Typst engine, not a PDF importer.** Opening a PDF and editing it in place is not
