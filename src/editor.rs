@@ -52,6 +52,8 @@ pub struct Editor {
     /// Whether the source pane holds the keyboard. egui drops focus on an unmodified Escape,
     /// which Vim needs for leaving Insert mode, so the pane remembers it and takes focus back.
     vim_active: bool,
+    /// Take the keyboard as soon as the pane is first shown, so typing works without a click.
+    focus_on_show: bool,
     view: Option<ViewGeom>,
 }
 
@@ -67,6 +69,7 @@ impl Editor {
             vim: Vim::new(),
             vim_bindings: true,
             vim_active: false,
+            focus_on_show: true,
             view: None,
         }
     }
@@ -98,6 +101,11 @@ impl Editor {
         let row_h = probe.rows.first().map(|row| row.row.height()).unwrap_or(1.0).max(1.0);
         let char_w = ui.fonts_mut(|f| f.glyph_width(&mono, 'M')).max(1.0);
         let id = ui.make_persistent_id("typst-source");
+        if self.focus_on_show {
+            self.focus_on_show = false;
+            ui.memory_mut(|memory| memory.request_focus(id));
+            self.vim_active = true;
+        }
         let focused = ui.memory(|memory| memory.has_focus(id));
         let elsewhere = ui.memory(|memory| memory.focused()).is_some_and(|other| other != id);
         if focused {
