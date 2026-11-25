@@ -256,7 +256,9 @@ impl Editor {
             }
             self.cursor_byte = primary;
             self.cursor_line = line_of_byte(&self.text, primary);
-            if self.vim.moved {
+            // In Insert mode the `TextEdit` scrolls to the caret itself, on the frame it moved;
+            // scrolling from here as well would fight it (and could jump a row per keystroke).
+            if self.vim.moved && self.vim.mode != vim::Mode::Insert {
                 scroll_to = Some(byte_to_char(&self.text, primary));
             }
         }
@@ -264,9 +266,11 @@ impl Editor {
         // The text is laid out here rather than inside the `TextEdit`: the gutter, the current
         // line and the diagnostics need the same wrapped geometry the text is drawn with, in the
         // same frame. The `TextEdit` is handed this galley back, so it costs one layout.
+        // A first layout, before the widget runs: the content height and the scroll maths need
+        // the text's size before it is drawn. It is the same job the widget will build, so the
+        // galley cache hands the widget this very layout.
         let wrap_width = (ui.available_width() - gutter - 18.0).max(120.0);
         let galley = self.layout(ui, &mono, wrap_width, t);
-        let geometry = LineGeometry::new(&galley);
         self.row_h = galley.rows.first().map_or(self.size * 1.4, |row| row.row.size.y).max(1.0);
 
         let prompt: Option<(char, String)> = if self.vim_bindings { self.vim.prompt().map(|(sigil, line)| (sigil, line.to_string())) } else { None };
@@ -278,60 +282,36 @@ impl Editor {
             }
         }
 
-        let laid = galley.clone();
-        let expected = self.text.len();
+        // The widget lays out the text it is about to draw, which on the frame of a keystroke is
+        // one character longer than the text we laid out above. Build the job from *that* buffer
+        // (same runs, same wrap width), and keep the galley it produced: the bands and squiggles
+        // are painted from it after the text, so they belong to the same layout as the glyphs.
+        let runs = self.runs.clone();
+        let layout_font = mono.clone();
+        let layout_width = wrap_width;
+        let laid_out: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<egui::Galley>>>> = Default::default();
+        let slot = laid_out.clone();
         let base = t.text;
-        let mut layouter = move |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
-            if buffer.as_str().len() == expected {
-                return laid.clone();
-            }
-            // Should not happen (the buffer is the text we just laid out), but never hand the
-            // widget a galley that belongs to other text.
-            let mut job = LayoutJob::default();
-            job.wrap.max_width = wrap;
-            append(&mut job, &FontId::monospace(12.0), buffer.as_str(), 0, buffer.as_str().len(), base);
-            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        let mut layouter = move |ui: &Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job_for(buffer.as_str(), &runs, &layout_font, layout_width, base)));
+            *slot.lock().unwrap() = Some(galley.clone());
+            galley
         };
 
         let output = scroll.show(ui, |ui| {
             let clip = ui.clip_rect();
-            let content = vec2(clip.width().max(1.0), (PADDING_TOP + galley.size().y + PADDING_BOTTOM + reserved).max(clip.height()));
+            let content = vec2(clip.width().max(1.0), (PADDING_TOP + galley.size().y + PADDING_BOTTOM + reserved + self.row_h * 2.0).max(clip.height()));
             let (rect, _) = ui.allocate_exact_size(content, egui::Sense::hover());
             let text_origin = rect.min + vec2(gutter, PADDING_TOP);
-            let text_rect = Rect::from_min_size(text_origin, vec2(wrap_width, galley.size().y));
+            let text_rect = Rect::from_min_size(text_origin, vec2(wrap_width, (content.y - PADDING_TOP - PADDING_BOTTOM).max(self.row_h)));
             let painter = ui.painter().clone();
 
-            // The current line, under the text: the TextEdit's own frame is off, so this shows
-            // through behind the glyphs. A wrapped line is one band over all of its rows.
-            if let Some((top, height, _)) = geometry.line(self.cursor_line) {
-                let band = Rect::from_min_max(pos2(text_origin.x, text_origin.y + top), pos2(clip.right(), text_origin.y + top + height));
-                if band.intersects(clip) {
-                    painter.rect_filled(band, 0.0, if t.dark() { Color32::from_white_alpha(16) } else { Color32::from_black_alpha(14) });
-                    let bar = Rect::from_min_max(pos2(text_origin.x - 4.0, band.top()), pos2(text_origin.x - 1.0, band.bottom()));
-                    painter.rect_filled(bar, 1.0, t.accent.gamma_multiply(0.55));
-                }
-            }
-
-            // Diagnostics: the line is washed faintly, the offending span more strongly, so the
-            // eye finds the line first and then the column.
-            let (error_color, warning_color) = diagnostic_colors(t);
-            for mark in &self.marks {
-                let Some((top, height, _)) = geometry.line(mark.line) else { continue };
-                let color = if mark.error { error_color } else { warning_color };
-                let line_band = Rect::from_min_max(pos2(text_origin.x, text_origin.y + top), pos2(clip.right(), text_origin.y + top + height));
-                if line_band.intersects(clip) {
-                    painter.rect_filled(line_band, 0.0, color.gamma_multiply(if t.dark() { 0.07 } else { 0.045 }));
-                }
-                for (x0, x1, row_top, row_h) in self.mark_segments(&galley, mark) {
-                    let band = Rect::from_min_max(
-                        pos2(text_origin.x + x0, text_origin.y + row_top + 1.0),
-                        pos2(text_origin.x + x1, text_origin.y + row_top + row_h - 2.0),
-                    );
-                    if band.intersects(clip) {
-                        painter.rect_filled(band, 2.0, color.gamma_multiply(if t.dark() { 0.16 } else { 0.10 }));
-                    }
-                }
-            }
+            // Backgrounds are reserved here, before the text, and filled in below once the
+            // widget has laid the text out: they must sit *behind* the glyphs, but their
+            // geometry is only known after the layout.
+            let line_band_slot = painter.add(egui::Shape::Noop);
+            let mark_slots: Vec<(egui::layers::ShapeIdx, egui::layers::ShapeIdx)> =
+                self.marks.iter().map(|_| (painter.add(egui::Shape::Noop), painter.add(egui::Shape::Noop))).collect();
 
             let response = ui.put(
                 text_rect,
@@ -345,6 +325,46 @@ impl Editor {
                     .lock_focus(true)
                     .layouter(&mut layouter),
             );
+
+            // The text's own layout, from the widget.
+            let galley = laid_out.lock().unwrap().take().unwrap_or_else(|| self.layout(ui, &mono, wrap_width, t));
+            let geometry = LineGeometry::new(&galley);
+            self.row_h = galley.rows.first().map_or(self.size * 1.4, |row| row.row.size.y).max(1.0);
+
+            // The current line, under the text: the TextEdit's own frame is off, so this shows
+            // through behind the glyphs. A wrapped line is one band over all of its rows.
+            if let Some((top, height, _)) = geometry.line(self.cursor_line) {
+                let band = Rect::from_min_max(pos2(text_origin.x, text_origin.y + top), pos2(clip.right(), text_origin.y + top + height));
+                if band.intersects(clip) {
+                    painter.set(line_band_slot, egui::Shape::rect_filled(band, 0.0, if t.dark() { Color32::from_white_alpha(16) } else { Color32::from_black_alpha(14) }));
+                    let bar = Rect::from_min_max(pos2(text_origin.x - 4.0, band.top()), pos2(text_origin.x - 1.0, band.bottom()));
+                    painter.rect_filled(bar, 1.0, t.accent.gamma_multiply(0.55));
+                }
+            }
+
+            // Diagnostics: the line is washed faintly, the offending span more strongly, so the
+            // eye finds the line first and then the column.
+            let (error_color, warning_color) = diagnostic_colors(t);
+            for (mark, (line_slot, span_slot)) in self.marks.iter().zip(&mark_slots) {
+                let Some((top, height, _)) = geometry.line(mark.line) else { continue };
+                let color = if mark.error { error_color } else { warning_color };
+                let line_band = Rect::from_min_max(pos2(text_origin.x, text_origin.y + top), pos2(clip.right(), text_origin.y + top + height));
+                if line_band.intersects(clip) {
+                    painter.set(*line_slot, egui::Shape::rect_filled(line_band, 0.0, color.gamma_multiply(if t.dark() { 0.07 } else { 0.045 })));
+                }
+                let mut shape = egui::Shape::Noop;
+                for (x0, x1, row_top, row_h) in self.mark_segments(&galley, mark) {
+                    let band = Rect::from_min_max(
+                        pos2(text_origin.x + x0, text_origin.y + row_top + 1.0),
+                        pos2(text_origin.x + x1, text_origin.y + row_top + row_h - 2.0),
+                    );
+                    if band.intersects(clip) {
+                        shape = egui::Shape::rect_filled(band, 2.0, color.gamma_multiply(if t.dark() { 0.16 } else { 0.10 }));
+                        break;
+                    }
+                }
+                painter.set(*span_slot, shape);
+            }
 
             for mark in &self.marks {
                 let color = if mark.error { error_color } else { warning_color };
@@ -418,30 +438,7 @@ impl Editor {
 
     /// Lay the buffer out with its syntax colours, wrapped at `wrap_width`.
     fn layout(&self, ui: &Ui, mono: &FontId, wrap_width: f32, t: &Tokens) -> std::sync::Arc<egui::Galley> {
-        let mut job = LayoutJob::default();
-        job.wrap.max_width = wrap_width;
-        let mut at = 0usize;
-        for (range, color) in self.runs.iter() {
-            if range.start >= self.text.len() {
-                break;
-            }
-            if range.start > at {
-                append(&mut job, mono, &self.text, at, range.start, t.text);
-            }
-            let end = range.end.min(self.text.len());
-            if range.start < end {
-                append(&mut job, mono, &self.text, range.start, end, *color);
-            }
-            at = end;
-        }
-        if at < self.text.len() {
-            append(&mut job, mono, &self.text, at, self.text.len(), t.text);
-        }
-        if self.text.is_empty() {
-            // An empty buffer still needs a row to put the caret on.
-            job.append(" ", 0.0, egui::TextFormat { font_id: mono.clone(), color: Color32::TRANSPARENT, ..Default::default() });
-        }
-        ui.fonts_mut(|fonts| fonts.layout_job(job))
+        ui.fonts_mut(|fonts| fonts.layout_job(job_for(&self.text, &self.runs, mono, wrap_width, t.text)))
     }
 
     /// The rectangles a diagnostic covers, in text-local coordinates: one per visual row, since
@@ -521,6 +518,36 @@ fn diagnostic_colors(t: &Tokens) -> (Color32, Color32) {
     } else {
         (Color32::from_rgb(255, 0, 0), Color32::from_rgb(0, 0, 255))
     }
+}
+
+/// The layout job for a piece of text with the editor's syntax colours. Used for the layout the
+/// geometry is measured from and for the one the widget draws, so both can hit the same cache
+/// entry when they describe the same text.
+fn job_for(text: &str, runs: &[(Range<usize>, Color32)], mono: &FontId, wrap_width: f32, base: Color32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    let mut at = 0usize;
+    for (range, color) in runs {
+        if range.start >= text.len() {
+            break;
+        }
+        if range.start > at {
+            append(&mut job, mono, text, at, range.start, base);
+        }
+        let end = range.end.min(text.len());
+        if range.start < end {
+            append(&mut job, mono, text, range.start, end, *color);
+        }
+        at = at.max(end);
+    }
+    if at < text.len() {
+        append(&mut job, mono, text, at, text.len(), base);
+    }
+    if text.is_empty() {
+        // An empty buffer still needs a row to put the caret on.
+        job.append(" ", 0.0, egui::TextFormat { font_id: mono.clone(), color: Color32::TRANSPARENT, ..Default::default() });
+    }
+    job
 }
 
 /// A wavy underline, the way an editor says "this bit is wrong".

@@ -243,6 +243,16 @@ result as an egui texture. A request whose page left the screen is replaced, not
   `prefer_next_row`), so the pane now only stores the range when the caret actually moved -
   storing it every frame looked like a selection change on every frame, which made the widget
   re-scroll to the caret on every frame.
+* **The text keeps its colours on the frame you type in.** The pane lays the text out twice per
+  frame in the worst case — once before the widget (to know the content's size and where the
+  caret sits) and once by the widget itself, which sees the text *after* this frame's keystroke.
+  It used to hand the widget the galley it had laid out, so on every keystroke the widget was
+  given a stale layout and drew the whole buffer in one plain colour for a frame: a visible
+  flash per character. Now the widget always lays out the buffer it is given, and the current
+  line and diagnostic washes are painted from *that* layout through shape slots reserved
+  before the text. (egui has no partial redraw: the window is repainted as a whole, so the fix
+  is to keep each frame's work correct and cheap rather than to repaint one line.) In Insert
+  mode the widget also does the scrolling; the pane no longer scrolls as well.
 * **Vim is a subset.** See the table above: no marks, macros, block Visual, `.` repeat or named
   registers. Undo snapshots copy the whole buffer, so a very large document pays for `u`; the
   history keeps the last 400 changes.
