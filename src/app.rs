@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use egui::{Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, vec2};
+use egui::{Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use typst_layout::PagedDocument;
 
 use crate::editor::{self, Editor};
@@ -522,6 +522,10 @@ impl App {
                     doc.compiling = false;
                     doc.millis = outcome.millis;
                     doc.diagnostics = outcome.diagnostics;
+                    // The marks are byte ranges into the text that was compiled; while newer
+                    // keystrokes are waiting for their own compile they no longer line up.
+                    let marks = if doc.edited_at.is_some() { Vec::new() } else { marks_for(&doc.editor.text, &doc.diagnostics) };
+                    doc.editor.set_marks(marks);
                     if let Some(document) = outcome.document {
                         doc.metas = outcome.pages;
                         // Keep the old rasters: they stay on screen (stretched to the new page
@@ -1027,6 +1031,7 @@ impl App {
                     if output.changed {
                         let now = ui.input(|input| input.time);
                         doc.edited_at = Some(now);
+                        doc.editor.clear_marks();
                     }
                     if let Some(request) = output.request {
                         // The document list is out of the window for this pass, so the command
@@ -1068,7 +1073,11 @@ impl App {
                     ui.painter().rect_filled(rect, CornerRadius::same(4), color.gamma_multiply(0.12));
                     ui.painter().text(rect.center(), Align2::CENTER_CENTER, &mode, theme::semibold(10.5), color);
                 }
-                ui.label(RichText::new(format!("line {} of {}", doc.editor.cursor_line + 1, doc.editor.line_count())).font(theme::regular(11.0)).color(t.text_faint));
+                ui.label(
+                    RichText::new(format!("{}:{} / {}", doc.editor.cursor_line + 1, doc.editor.cursor_column() + 1, doc.editor.line_count()))
+                        .font(theme::regular(11.0))
+                        .color(t.text_faint),
+                );
                 if !doc.editor.vim.message.is_empty() {
                     ui.add(egui::Label::new(RichText::new(&doc.editor.vim.message).font(theme::regular(11.0)).color(t.text_muted)).truncate());
                 }
@@ -1095,9 +1104,21 @@ impl App {
             let color = Color32::from_rgb(0xC0, 0x39, 0x2B);
             ui.painter().rect_filled(rect, 0.0, color.gamma_multiply(if t.dark() { 0.22 } else { 0.10 }));
             ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, color.gamma_multiply(0.35)));
+            let hint = ui.painter().layout_no_wrap("Open Problems".to_string(), theme::medium(12.0), color);
+            let hint_width = hint.size().x;
+            ui.painter().galley(rect.right_center() - vec2(14.0 + hint_width, hint.size().y * 0.5), hint, color);
+            // The band narrows when a panel is open: cut the message rather than let it run
+            // under the hint.
             let message = format!("The pages show the last good compile — the source has {errors} error{}.", if errors == 1 { "" } else { "s" });
-            ui.painter().text(rect.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, message, theme::regular(12.5), color);
-            ui.painter().text(rect.right_center() - vec2(14.0, 0.0), Align2::RIGHT_CENTER, "Open Problems", theme::medium(12.0), color);
+            let mut job = egui::text::LayoutJob::single_section(message, egui::TextFormat { font_id: theme::regular(12.5), color, ..Default::default() });
+            job.wrap = egui::text::TextWrapping {
+                max_width: (rect.width() - hint_width - 44.0).max(40.0),
+                max_rows: 1,
+                break_anywhere: false,
+                overflow_character: Some('…'),
+            };
+            let galley = ui.painter().layout_job(job);
+            ui.painter().galley(pos2(rect.left() + 14.0, rect.center().y - galley.size().y * 0.5), galley, color);
             if response.clicked() {
                 self.right = Some(RightPanel::Problems);
             }
@@ -1720,13 +1741,13 @@ fn problems_panel(ui: &mut egui::Ui, doc: &mut Doc, filter: &mut String) {
             if response.hovered() {
                 ui.painter().rect_filled(response.rect, CornerRadius::same(6), t.hover);
             }
-            if response.clicked() {
-                jump = Some(diagnostic.line);
+            if response.clicked() && diagnostic.file.is_none() {
+                jump = Some((diagnostic.line, diagnostic.column));
             }
         }
     });
-    if let Some(line) = jump {
-        doc.editor.go_to_line(line);
+    if let Some((line, column)) = jump {
+        doc.editor.go_to_position(line, column);
     }
 }
 
@@ -1781,6 +1802,36 @@ fn log_panel(ui: &mut egui::Ui, compiler: &Compiler) {
             ui.label(RichText::new(line).monospace().small());
         }
     });
+}
+
+/// Turn the compile's diagnostics into marks for the editor: which line, which column, how many
+/// characters to underline. Ranges are byte offsets into `text`; anything that points into an
+/// included file is left out (there is no line in this buffer for it).
+fn marks_for(text: &str, diagnostics: &[Diagnostic]) -> Vec<editor::Mark> {
+    let starts: Vec<usize> = std::iter::once(0).chain(text.match_indices('\n').map(|(index, _)| index + 1)).collect();
+    let mut marks = Vec::new();
+    for diagnostic in diagnostics {
+        if diagnostic.file.is_some() {
+            continue;
+        }
+        let (line, column, len) = match &diagnostic.range {
+            Some(range) => {
+                let start = range.start.min(text.len());
+                let end = range.end.clamp(start, text.len());
+                let line = starts.partition_point(|&offset| offset <= start).saturating_sub(1);
+                let line_begin = starts.get(line).copied().unwrap_or(0);
+                let line_end = text[line_begin..].find('\n').map_or(text.len(), |offset| line_begin + offset);
+                let column = text[line_begin..start].chars().count();
+                let covered = text[start..end.min(line_end)].chars().count().max(1);
+                (line, column, covered)
+            }
+            // A diagnostic without a span (an included file's error, a detached one) still has a
+            // line and column: mark the single character there.
+            None => (diagnostic.line, diagnostic.column, 1),
+        };
+        marks.push(editor::Mark { line, column, len, error: diagnostic.is_error() });
+    }
+    marks
 }
 
 /// The compile status in the mode bar and the source header.
@@ -1889,4 +1940,42 @@ fn nearest_hit(meta: &PageMeta, x: f32, y: f32) -> Option<engine::Hit> {
         }
     }
     best.filter(|(distance, _)| *distance < 900.0).map(|(_, hit)| hit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use typst::diag::Severity;
+
+    fn diagnostic(severity: Severity, range: Option<std::ops::Range<usize>>, line: usize, column: usize) -> Diagnostic {
+        Diagnostic { severity, message: String::new(), hints: Vec::new(), line, column, file: None, range }
+    }
+
+    #[test]
+    fn marks_carry_line_column_and_length() {
+        let text = "= Title\n\nSome #bad() here\n";
+        let bad = text.find("#bad").unwrap();
+        let marks = marks_for(text, &[diagnostic(Severity::Error, Some(bad..bad + 4), 2, 5)]);
+        assert_eq!(marks.len(), 1);
+        assert_eq!((marks[0].line, marks[0].column, marks[0].len), (2, 5, 4));
+        assert!(marks[0].error);
+    }
+
+    #[test]
+    fn a_warning_is_marked_as_one_and_a_span_across_lines_is_clamped() {
+        let text = "first line\nsecond\n";
+        let start = text.find("line").unwrap();
+        // Ran to the end of the buffer: the mark stops at this line's newline.
+        let marks = marks_for(text, &[diagnostic(Severity::Warning, Some(start..text.len()), 0, 6)]);
+        assert_eq!((marks[0].line, marks[0].column, marks[0].len), (0, 6, 4));
+        assert!(!marks[0].error);
+    }
+
+    #[test]
+    fn a_diagnostic_in_an_included_file_is_left_out() {
+        let text = "= Title\n";
+        let mut other = diagnostic(Severity::Error, Some(0..2), 0, 0);
+        other.file = Some("chapter.typ".to_string());
+        assert!(marks_for(text, &[other]).is_empty());
+    }
 }

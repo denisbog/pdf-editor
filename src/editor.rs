@@ -35,12 +35,28 @@ pub struct EditorOutput {
     pub request: Option<vim::Request>,
 }
 
+/// A diagnostic's place in the buffer: a line, and the run of characters on it to underline.
+#[derive(Clone, Debug)]
+pub struct Mark {
+    /// 0-based line.
+    pub line: usize,
+    /// 0-based column in characters from the line's start.
+    pub column: usize,
+    /// How many characters the diagnostic covers (at least one).
+    pub len: usize,
+    pub error: bool,
+}
+
 pub struct Editor {
     pub text: String,
-    /// A line to put the cursor on, set by a click on a page or a diagnostic.
-    goto: Option<usize>,
+    /// A line (and column) to put the cursor on, set by a click on a page or a problem.
+    goto: Option<(usize, usize)>,
+    /// Places the last compile complained about, underlined in the text and marked in the gutter.
+    marks: Vec<Mark>,
     /// The line the cursor was on last frame.
     pub cursor_line: usize,
+    /// The cursor as a byte offset, for the column in the status line.
+    cursor_byte: usize,
     /// The syntax-coloured runs of the current text.
     runs: Arc<Vec<(Range<usize>, Color32)>>,
     /// `(hash, len, dark)` of the text the runs were computed for.
@@ -63,7 +79,9 @@ impl Editor {
         Self {
             text,
             goto: None,
+            marks: Vec::new(),
             cursor_line: 0,
+            cursor_byte: 0,
             runs: Arc::new(Vec::new()),
             coloured: None,
             size: 12.5,
@@ -77,11 +95,46 @@ impl Editor {
 
     /// Ask for the cursor to be put on `line` (0-based) the next time the editor is shown.
     pub fn go_to_line(&mut self, line: usize) {
-        self.goto = Some(line);
+        self.goto = Some((line, 0));
+    }
+
+    /// Put the cursor on a line and column (0-based, characters), e.g. a diagnostic's place.
+    pub fn go_to_position(&mut self, line: usize, column: usize) {
+        self.goto = Some((line, column));
+    }
+
+    /// The places the last compile complained about; replaced on every compile.
+    pub fn set_marks(&mut self, marks: Vec<Mark>) {
+        self.marks = marks;
+    }
+
+    /// Forget the marks: the text moved on, so their offsets no longer hold.
+    pub fn clear_marks(&mut self) {
+        self.marks.clear();
+    }
+
+    /// Byte offset of a line/column pair.
+    fn byte_at(&self, line: usize, column: usize) -> usize {
+        let start = self.line_start(line);
+        let end = self.text[start..].find('\n').map_or(self.text.len(), |offset| start + offset);
+        let mut byte = start;
+        for _ in 0..column {
+            if byte >= end {
+                break;
+            }
+            byte += self.text[byte..].chars().next().map_or(0, char::len_utf8);
+        }
+        byte
     }
 
     pub fn line_count(&self) -> usize {
         self.text.lines().count().max(1)
+    }
+
+    /// The cursor's column, 0-based, in characters from the line's start.
+    pub fn cursor_column(&self) -> usize {
+        let start = self.line_start(self.cursor_line);
+        self.text[start.min(self.text.len())..self.cursor_byte.min(self.text.len())].chars().count()
     }
 
     /// The mode indicator: `NORMAL`, `INSERT`, … and any operator being typed.
@@ -134,11 +187,12 @@ impl Editor {
         let gutter = digits as f32 * char_w + 26.0;
 
         let mut scroll_to = None;
-        if let Some(line) = self.goto.take() {
+        if let Some((line, column)) = self.goto.take() {
             if self.vim_bindings {
-                self.vim.set_line(&self.text, line);
+                let byte = self.byte_at(line, column);
+                self.vim.set_cursor(&self.text, byte);
             } else {
-                let byte = self.line_start(line);
+                let byte = self.byte_at(line, column);
                 let index = self.text[..byte].chars().count();
                 let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
                 state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(index))));
@@ -156,6 +210,7 @@ impl Editor {
             let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
             state.cursor.set_char_range(Some(range));
             state.store(ui.ctx(), id);
+            self.cursor_byte = primary;
             self.cursor_line = line_of_byte(&self.text, primary);
             if self.vim.moved {
                 scroll_to = Some(self.cursor_line);
@@ -220,6 +275,27 @@ impl Editor {
                 ui.painter().rect_filled(bar, 1.0, t.accent.gamma_multiply(0.55));
             }
 
+            let first_visible = (((clip.top() - text_rect.top()) / row_h).floor() as isize).max(0) as usize;
+            let last_visible = (((clip.bottom() - text_rect.top()) / row_h).ceil() as isize).max(0) as usize + 1;
+            // Diagnostics: a washed band and a squiggle under the exact span, so the message has
+            // a place in the text and not only a line number.
+            let (error_color, warning_color) = diagnostic_colors(t);
+            for mark in self.marks.iter().filter(|mark| mark.line >= first_visible && mark.line <= last_visible) {
+                let row_top = text_rect.top() + mark.line as f32 * row_h;
+                let x0 = text_rect.left() + mark.column as f32 * char_w;
+                let x1 = (x0 + mark.len.max(1) as f32 * char_w).min(clip.right());
+                if x1 <= clip.left() {
+                    continue;
+                }
+                let color = if mark.error { error_color } else { warning_color };
+                // The whole line is washed faintly, the offending span more strongly: the eye
+                // finds the line first, then the column.
+                let line_band = Rect::from_min_max(pos2(clip.left() + gutter, row_top), pos2(clip.right(), row_top + row_h));
+                ui.painter().rect_filled(line_band, 0.0, color.gamma_multiply(if t.dark() { 0.07 } else { 0.045 }));
+                let band = Rect::from_min_max(pos2(x0.max(clip.left()), row_top + 1.0), pos2(x1, row_top + row_h - 2.0));
+                ui.painter().rect_filled(band, 2.0, color.gamma_multiply(if t.dark() { 0.16 } else { 0.10 }));
+            }
+
             let response = ui.put(
                 text_rect,
                 TextEdit::multiline(&mut self.text)
@@ -235,16 +311,36 @@ impl Editor {
 
             // The gutter is painted over the viewport's left edge, so the numbers stay put
             // while the text scrolls sideways.
+            for mark in self.marks.iter().filter(|mark| mark.line >= first_visible && mark.line <= last_visible) {
+                let row_top = text_rect.top() + mark.line as f32 * row_h;
+                let x0 = (text_rect.left() + mark.column as f32 * char_w).max(clip.left());
+                let x1 = (text_rect.left() + (mark.column + mark.len.max(1)) as f32 * char_w).min(clip.right());
+                if x1 <= clip.left() {
+                    continue;
+                }
+                let color = if mark.error { error_color } else { warning_color };
+                squiggle(ui.painter(), x0, x1, row_top + row_h - 1.5, color);
+            }
+
             let gutter_rect = Rect::from_min_max(pos2(clip.left(), clip.top()), pos2(clip.left() + gutter, clip.bottom()));
             ui.painter().rect_filled(gutter_rect, 0.0, t.panel);
             ui.painter().vline(gutter_rect.right() - 0.5, gutter_rect.y_range(), Stroke::new(1.0, t.divider));
             let number_font = FontId::monospace(self.size - 1.5);
-            let first = (((clip.top() - text_rect.top()) / row_h).floor() as isize).max(0) as usize;
-            let last = (((clip.bottom() - text_rect.top()) / row_h).ceil() as isize).max(0) as usize + 1;
-            for line in first..last.min(lines) {
+            for line in first_visible..last_visible.min(lines) {
                 let y = text_rect.top() + line as f32 * row_h + row_h * 0.5;
-                let color = if line == self.cursor_line { t.accent_text } else { t.text_faint.gamma_multiply(0.85) };
+                let mark = self.marks.iter().find(|mark| mark.line == line);
+                let color = match mark {
+                    Some(mark) if mark.error => error_color,
+                    Some(_) => warning_color,
+                    None if line == self.cursor_line => t.accent_text,
+                    None => t.text_faint.gamma_multiply(0.85),
+                };
                 ui.painter().text(pos2(gutter_rect.right() - 8.0, y), Align2::RIGHT_CENTER, (line + 1).to_string(), number_font.clone(), color);
+                if mark.is_some() {
+                    // A tick in the gutter's left edge, the same mark the numbers carry.
+                    let bar = Rect::from_min_max(pos2(gutter_rect.left() + 2.0, y - row_h * 0.35), pos2(gutter_rect.left() + 4.5, y + row_h * 0.35));
+                    ui.painter().rect_filled(bar, 1.0, color);
+                }
             }
             self.view = Some(ViewGeom { text_top: text_rect.top(), text_left: text_rect.left(), clip, row_h });
             response
@@ -260,11 +356,13 @@ impl Editor {
                     self.vim.sync(&self.text, primary, secondary);
                 }
             }
-            self.cursor_line = line_of_byte(&self.text, self.vim.cursor());
+            self.cursor_byte = self.vim.cursor();
+            self.cursor_line = line_of_byte(&self.text, self.cursor_byte);
         } else if let Some(state) = TextEdit::load_state(ui.ctx(), id) {
             if let Some(range) = state.cursor.char_range() {
                 let index = range.primary.index.0.min(self.text.chars().count());
                 let byte = self.text.char_indices().nth(index).map_or(self.text.len(), |(byte, _)| byte);
+                self.cursor_byte = byte;
                 self.cursor_line = self.text[..byte].matches('\n').count();
             }
         }
@@ -328,6 +426,31 @@ impl Editor {
         self.runs = Arc::new(runs);
         self.coloured = Some((hash, self.text.len(), t.dark()));
     }
+}
+
+/// The colours a diagnostic's mark is drawn in for this theme.
+fn diagnostic_colors(t: &Tokens) -> (Color32, Color32) {
+    if t.dark() {
+        (Color32::from_rgb(0xF0, 0x7A, 0x7A), Color32::from_rgb(0xE0, 0xA9, 0x6C))
+    } else {
+        (Color32::from_rgb(255, 0, 0), Color32::from_rgb(0, 0, 255))
+    }
+}
+
+/// A wavy underline, the way an editor says "this bit is wrong".
+fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: Color32) {
+    const STEP: f32 = 3.0;
+    const AMPLITUDE: f32 = 1.4;
+    let mut points = Vec::with_capacity(((x1 - x0) / STEP).max(1.0) as usize + 2);
+    let mut x = x0;
+    let mut up = true;
+    while x < x1 {
+        points.push(pos2(x, if up { y - AMPLITUDE } else { y + AMPLITUDE }));
+        up = !up;
+        x += STEP;
+    }
+    points.push(pos2(x1, y));
+    painter.add(egui::Shape::line(points, Stroke::new(1.1, color)));
 }
 
 fn byte_to_char(text: &str, byte: usize) -> usize {

@@ -61,9 +61,12 @@ are compiled once and rasterised at whatever zoom the view needs.
 * **Syntax colours from Typst's own parser.** The editor does not pattern-match markup: it
   parses the buffer with `typst::syntax::parse` and colours the leaves (keywords, strings,
   numbers, math, labels, markers), so the highlighting cannot drift from the language.
-* **Problems with places.** Compile errors and warnings are listed with file:line:column and
-  hints; a click puts the caret on the line. Panels for the document's page sizes and stats,
-  and a compile/export log.
+* **Problems, in the text and in a list.** The compile's errors and warnings are underlined
+  where they happen: the line is washed, the offending span carries a squiggle, and the gutter
+  turns the line number red (error) or amber (warning) with a tick beside it. The Problems panel
+  lists the same diagnostics with file:line:column and hints; a click puts the caret on the
+  exact line *and* column, and the header reads `line:column / lines`. Marks disappear on the
+  first keystroke and come back with the next compile, so they never point at stale offsets.
 * **Tabs, sessions and PDF export.** Each document opens in its own tab (`Ctrl+Tab` switches,
   the `x` closes, unsaved changes are confirmed before closing); the tabs and the page each
   was on are restored at the next start. **Export PDF** (`Ctrl+E`) writes the compiled

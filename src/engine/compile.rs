@@ -6,6 +6,7 @@
 //! buffer changes again before the previous compile finished, the older request is dropped —
 //! only the newest source matters. PDF export runs on the same thread.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::Arc;
@@ -31,6 +32,9 @@ pub struct Diagnostic {
     pub column: usize,
     /// The file's name when it is not the main one (an included file, a package).
     pub file: Option<String>,
+    /// The byte range the diagnostic covers in the main source, when it points there. The editor
+    /// underlines it, so the message has a place and not only a line number.
+    pub range: Option<Range<usize>>,
 }
 
 impl Diagnostic {
@@ -234,13 +238,16 @@ fn diagnostic(world: &TypstWorld, source_diagnostic: &SourceDiagnostic) -> Diagn
     let mut line = 0;
     let mut column = 0;
     let mut file = None;
+    let mut covered = None;
     if let Some(range) = world.range(span) {
         if let Ok(source) = world.source(span.id().unwrap_or(world.main())) {
             if let Some((l, c)) = source.lines().byte_to_line_column(range.start) {
                 line = l;
                 column = c;
             }
-            if span.id() != Some(world.main()) {
+            if span.id() == Some(world.main()) {
+                covered = Some(range);
+            } else {
                 file = Some(source.id().vpath().get_without_slash().to_string());
             }
         }
@@ -252,6 +259,7 @@ fn diagnostic(world: &TypstWorld, source_diagnostic: &SourceDiagnostic) -> Diagn
         line,
         column,
         file,
+        range: covered,
     }
 }
 

@@ -207,14 +207,6 @@ impl Vim {
         }
     }
 
-    /// Put the cursor on a line, in Normal mode.
-    pub fn set_line(&mut self, text: &str, line: usize) {
-        let start = line_range(text, line).0;
-        self.set_cursor(text, start);
-        self.mode = Mode::Normal;
-        self.anchor = None;
-    }
-
     /// The mode indicator, with any count or operator being typed.
     pub fn status(&self) -> String {
         let mut status = self.mode.label().to_string();
