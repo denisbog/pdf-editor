@@ -12,8 +12,9 @@ use typst::syntax::{SyntaxKind, SyntaxNode};
 use crate::theme::Tokens;
 use crate::vim::{self, Vim};
 
-/// How long after the last keystroke the document is compiled again.
-pub const DEBOUNCE: f64 = 0.22;
+/// How long after the last keystroke the document is typeset again. The page view is meant to
+/// settle once you stop typing, not to follow every word.
+pub const DEBOUNCE: f64 = 0.6;
 /// Height of the command line (`:w`, `/pattern`) drawn at the bottom of the pane.
 const PROMPT_HEIGHT: f32 = 26.0;
 

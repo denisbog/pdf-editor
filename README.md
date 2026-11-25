@@ -46,9 +46,12 @@ are compiled once and rasterised at whatever zoom the view needs.
 
 * **The page view is the compile.** One compile produces the pages you read *and* the PDF you
   export. There is no separate preview renderer, no screenshot of an older run.
-* **Live typesetting.** Edits are compiled after a 220 ms pause (Ctrl+R compiles at once), on
-  a background thread — typing never waits for layout. When the source does not compile, the
-  last good pages stay on screen and a banner says why.
+* **Typeset when you stop, not on every key.** Edits are compiled once typing has paused for
+  0.6 s (Ctrl+R typesets at once), on a background thread — the page view settles after a
+  sentence rather than following every word. While a new compile runs, the pages already on
+  screen stay there (stretched, if their size changed) until the new rasters are ready, so the
+  view never blanks or flickers mid-word. When the source does not compile, the last good pages
+  stay on screen and a banner says why.
 * **Click a page, land in the source.** Every text run in the layout carries the span it was
   set from, so a click maps page point → glyph → source line. The caret goes there, the line
   is marked in the gutter, and the view switches out of *Preview* so you can see it. Hovering

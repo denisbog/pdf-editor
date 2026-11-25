@@ -125,6 +125,9 @@ enum PendingAction {
 pub struct Slot {
     pub texture: Option<egui::TextureHandle>,
     pub scale: f32,
+    /// The compile generation the texture was rendered from. A texture from an older
+    /// generation stays on screen while the new one is rendered, so typing never blanks a page.
+    gen: u64,
     pending: Option<(u64, f32)>,
     pub error: Option<String>,
 }
@@ -521,8 +524,13 @@ impl App {
                     doc.diagnostics = outcome.diagnostics;
                     if let Some(document) = outcome.document {
                         doc.metas = outcome.pages;
-                        doc.pages.clear();
+                        // Keep the old rasters: they stay on screen (stretched to the new page
+                        // size if it changed) until the new generation's rasters arrive.
                         doc.pages.resize_with(doc.metas.len(), Slot::default);
+                        for slot in &mut doc.pages {
+                            slot.pending = None;
+                            slot.error = None;
+                        }
                         doc.document = Some(document.clone());
                         doc.shown_gen = gen;
                         self.rasters.set_document(gen, document);
@@ -557,6 +565,7 @@ impl App {
             let texture = ctx.load_texture(format!("page-{doc_id}-{}", raster.page), image, egui::TextureOptions::LINEAR);
             slot.texture = Some(texture);
             slot.scale = raster.scale;
+            slot.gen = raster.gen;
             slot.error = None;
         }
         // Compile what was edited, once the typing has settled.
@@ -1183,7 +1192,7 @@ impl App {
 
                 if visible && doc.shown_gen != 0 {
                     if let Some(slot) = doc.pages.get(page) {
-                        let satisfied = slot.texture.is_some() && (slot.scale - scale).abs() < 0.01;
+                        let satisfied = slot.texture.is_some() && (slot.scale - scale).abs() < 0.01 && slot.gen == doc.shown_gen;
                         let pending = slot.pending.is_some_and(|(_, pending_scale)| (pending_scale - scale).abs() < 0.01);
                         if !satisfied && !pending {
                             let tag = self.rasters.tag();
