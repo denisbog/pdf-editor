@@ -1,0 +1,37 @@
+[package]
+name = "pdf-editor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "A Typst editor whose page view is the typeset document: edit the source, read the pages, export the PDF"
+publish = false
+
+[dependencies]
+# The typesetting engine. Pages are laid out by `typst`, rasterised by `typst-render`
+# and exported by `typst-pdf`; `typst-kit` supplies the embedded and system fonts.
+typst = "0.15.1"
+typst-layout = "0.15.1"
+typst-render = "0.15.1"
+typst-pdf = "0.15.1"
+typst-kit = { version = "0.15.1", features = ["embedded-fonts", "scan-fonts"] }
+time = { version = "0.3", features = ["local-offset"] }
+egui = "0.36"
+# `epaint` is egui's own paint/text crate: only `text::VariationCoords` is used here, to pick
+# a `wght` instance of the variable UI fonts.
+epaint = { version = "0.36", default-features = false }
+egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence", "accesskit", "x11", "wayland", "links"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Assets, from crates rather than from a PdfCraft checkout: the official Lucide SVG icons
+# (ISC) and the Inter / JetBrains Mono variable faces (OFL).
+lucide-static-svg = "1.54"
+damascene-fonts-inter = "0.1"
+damascene-fonts-jetbrains-mono = "0.1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
