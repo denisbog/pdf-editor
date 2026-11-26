@@ -202,7 +202,7 @@ pub fn tab_name<'a, M: Clone + 'a>(label: impl Into<String>, icon: &str, active:
 
 pub fn tab_close<'a, M: Clone + 'a>(active: bool, t: Tokens, on_press: M) -> Element<'a, M> {
     tip(
-        button(center_y(text("✕").size(11.0).color(if active { t.text_muted } else { t.text_faint })))
+        button(center_y(text("✕").size(13.0).color(if active { t.text_muted } else { t.text_faint })))
             .height(Length::Fixed(theme::TAB_HEIGHT))
             .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 4.0 })
             .on_press(on_press)
