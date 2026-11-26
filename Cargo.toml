@@ -17,6 +17,8 @@ typst-layout = "0.15.1"
 typst-render = "0.15.1"
 typst-pdf = "0.15.1"
 typst-kit = { version = "0.15.1", features = ["embedded-fonts", "scan-fonts"] }
+# The platform's data and cache directories, where `typst` keeps the packages it installed.
+dirs = "6"
 time = { version = "0.3", features = ["local-offset"] }
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }

@@ -267,7 +267,7 @@ fn diagnostic(world: &TypstWorld, source_diagnostic: &SourceDiagnostic) -> Diagn
             if span.id() == Some(world.main()) {
                 covered = Some(range);
             } else {
-                file = Some(source.id().vpath().get_without_slash().to_string());
+                file = Some(world.name(source.id()));
             }
         }
     }

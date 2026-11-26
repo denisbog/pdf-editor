@@ -119,8 +119,9 @@ editor and the badge disappears.
   with the build; everything installed on the machine is scanned at startup as well, so
   `#set text(font: "…")` can name any installed family. The first scan takes a moment — the
   mode bar says *loading fonts…* until it is done.
-* No network at runtime. `#import "@preview/…"` resolves only if the package is already in
-  Typst's package cache; there is no downloader here (see *Notes and limitations*).
+* No network at runtime. `#import "@preview/…"` resolves from the packages already installed
+  on the machine (`TYPST_PACKAGE_PATH`, then Typst's data and cache directories); there is no
+  downloader here (see *Notes and limitations*).
 
 ## Build & run
 
@@ -301,10 +302,12 @@ the "Implemented" section there records what landed and where it deviates.
 * **A Typst engine, not a PDF importer.** Opening a PDF and editing it in place is not
   something Typst can do; this app edits `.typ` files. A PDF → Typst converter in front of it
   is a separate project.
-* **No package downloader.** `@preview/…` imports resolve from Typst's local package cache
-  (`~/.cache/typst/packages`) and fail otherwise. Everything else — `#include`, `#import`
-  of local files, `#read`, images — resolves relative to the document's folder, as
-  `typst compile` does.
+* **No package downloader.** `@preview/…` imports resolve from the packages installed on the
+  machine — `$TYPST_PACKAGE_PATH`, then `~/.local/share/typst/packages` and
+  `~/.cache/typst/packages`, the same order `typst compile` looks in — and fail otherwise, so
+  `typst compile` (or `typst init @preview/…`) once is what installs them. Everything else —
+  `#include`, `#import` of local files, `#read`, images — resolves relative to the document's
+  folder, as `typst compile` does.
 * **One file per tab is the main source.** An included file can be read and typeset, but
   editing it means opening it in its own tab (and its edits are not noticed by the including
   document until it is compiled again).

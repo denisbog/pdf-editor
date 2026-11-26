@@ -3,24 +3,28 @@
 //! has (plus Typst's embedded ones).
 //!
 //! Only what is needed for editing a local document is implemented: there is no package
-//! downloader, so `@preview/…` imports resolve from `~/.cache/typst/packages` (or fail with
-//! the usual "package not found" diagnostic). Files are always resolved below the document's
-//! folder, which is also how `typst compile` treats a project root.
+//! downloader, so `@preview/…` imports resolve from the packages already installed on the
+//! machine (`TYPST_PACKAGE_PATH`, then the data and cache directories, like `typst compile`)
+//! or fail with the usual "package not found" diagnostic. Project files are always resolved
+//! below the document's folder, which is also how `typst compile` treats a project root.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use typst::diag::{FileError, FileResult};
+use typst::diag::{FileError, FileResult, PackageError};
 use typst::foundations::{Bytes, Datetime, Duration};
 use typst::{Library, LibraryExt};
+use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::World;
 
+use typst_kit::files::FsRoot;
 use typst_kit::fonts::FontStore;
+use typst_kit::packages::FsPackages;
 
 /// The standard library is built once per process: it is immutable and expensive to set up.
 fn library() -> &'static LazyHash<Library> {
@@ -87,10 +91,22 @@ impl TypstWorld {
         Self { root, main: id, source: Source::new(id, text), fonts, files: Mutex::new(HashMap::new()) }
     }
 
-    /// Where a virtual path lives on disk.
-    fn disk_path(&self, id: FileId) -> PathBuf {
-        let relative = id.vpath().get_without_slash();
-        self.root.join(relative)
+    /// The root a virtual file lives in: the document's folder for project files, the folder of
+    /// an installed package for `@preview/…` ones.
+    fn root_of(&self, id: FileId) -> FileResult<FsRoot> {
+        Ok(match id.root() {
+            VirtualRoot::Project => FsRoot::new(self.root.clone()),
+            VirtualRoot::Package(spec) => package_root(spec)?,
+        })
+    }
+
+    /// How a file is named in a diagnostic: its path inside the document's folder, or
+    /// `@preview/name:version/path` for a file of a package.
+    pub fn name(&self, id: FileId) -> String {
+        match id.root() {
+            VirtualRoot::Project => id.vpath().get_without_slash().into(),
+            VirtualRoot::Package(spec) => format!("{spec}{}", id.vpath().get_with_slash()),
+        }
     }
 
     fn load(&self, id: FileId) -> FileResult<Bytes> {
@@ -98,11 +114,34 @@ impl TypstWorld {
         if let Some(cached) = files.get(&id) {
             return cached.clone();
         }
-        let path = self.disk_path(id);
-        let result = std::fs::read(&path).map(Bytes::new).map_err(|error| FileError::from_io(error, &path));
+        let result = self.root_of(id).and_then(|root| root.load(id.vpath()));
         files.insert(id, result.clone());
         result
     }
+}
+
+/// The package directories `@preview/…` imports are read from, in the order the CLI looks at
+/// them: `TYPST_PACKAGE_PATH`, then the data directory and the cache one. There is no downloader,
+/// so a package that is not installed on the machine is a compile error rather than a download.
+fn package_dirs() -> Vec<FsPackages> {
+    let mut dirs: Vec<FsPackages> = std::env::var_os("TYPST_PACKAGE_PATH")
+        .map(|path| std::env::split_paths(&path).map(FsPackages::new).collect())
+        .unwrap_or_default();
+    if let Some(dir) = dirs::data_dir() {
+        dirs.push(FsPackages::new(dir.join("typst/packages")));
+    }
+    if let Some(dir) = dirs::cache_dir() {
+        dirs.push(FsPackages::new(dir.join("typst/packages")));
+    }
+    dirs
+}
+
+/// The folder an installed package version lives in.
+fn package_root(spec: &PackageSpec) -> FileResult<FsRoot> {
+    package_dirs()
+        .into_iter()
+        .find_map(|dirs| dirs.obtain(spec))
+        .ok_or_else(|| FileError::Package(PackageError::NotFound(spec.clone())))
 }
 
 impl World for TypstWorld {

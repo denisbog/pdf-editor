@@ -13,6 +13,7 @@ typst-layout.workspace = true
 typst-render.workspace = true
 typst-pdf.workspace = true
 typst-kit.workspace = true
+dirs.workspace = true
 time.workspace = true
 rfd.workspace = true
 serde.workspace = true

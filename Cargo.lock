@@ -4184,6 +4184,7 @@ dependencies = [
 name = "pdf-editor-core"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "rfd",
  "serde",
  "serde_json",
