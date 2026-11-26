@@ -45,6 +45,10 @@ const SIDE_MAX: f32 = 640.0;
 const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 6.0;
 const ZOOM_STEPS: [f32; 17] = [0.1, 0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 32.0];
+/// The compile status is redrawn on every compile, so it gets a slot of its own: a new time or a
+/// different diagnostic count must not shuffle the controls beside it. Wide enough for the widest
+/// label the status can produce ("999 warnings — 9999 ms") at the mode bar's type size.
+const STATUS_SLOT: f32 = 150.0;
 /// A raster is thrown away when it is this far from the scale the view wants.
 const SCALE_TOLERANCE: f32 = 0.01;
 /// The lane the page view's scrollbars occupy (7 px bar + a 1 px margin a side). The content
@@ -1490,7 +1494,7 @@ impl App {
 
         column![
             container(bar)
-                .height(Length::Fixed(TAB_STRIP - 1.0))
+             .height(Length::Fixed(TAB_STRIP))
                 .width(Length::Fill)
                 .padding(Padding { top: 0.0, bottom: 0.0, left: BAR_PAD, right: BAR_PAD })
                 .style(t.filled(t.titlebar)),
@@ -1501,28 +1505,36 @@ impl App {
 
     fn mode_bar(&self) -> Element<'_, Message> {
         let t = self.toks;
-        let mut views = row![].align_y(Alignment::Center);
-        for view in [View::Source, View::Split, View::Preview] {
-            views = views.push(widgets::mode_tab(view.label(), self.settings.view == view, t, Message::ViewChanged(view)));
-        }
-        let divider = container(Space::new().width(Length::Fixed(1.0)).height(Length::Fixed(22.0))).width(Length::Fixed(1.0)).height(Length::Fixed(22.0)).style(t.filled(t.divider));
-
-        let choices: Vec<ZoomStep> = ZOOM_STEPS.iter().map(|step| ZoomStep(*step)).collect();
-        let zoom = pick_list(choices, Some(ZoomStep(self.settings.zoom)), |step: ZoomStep| Message::ZoomStep(step))
-            .text_size(12.5)
-            .padding(Padding { top: 7.0, bottom: 7.0, left: 10.0, right: 8.0 })
-            .width(Length::Fixed(88.0))
-            .style(t.pick_list());
-
         // With no document open the view tabs, zoom and compile status would be dead controls.
-        let mut left = row![widgets::ghost_button("panel-left", "Menu", t, Message::Palette(true))].spacing(8).align_y(Alignment::Center);
-        let mut right = row![widgets::search_box("Find a command", 236.0, t, Message::Palette(true))].spacing(8).align_y(Alignment::Center);
-        if let Some(doc) = self.doc() {
+        let mut left = row![widgets::ghost_button("panel-left", "Menu", t, Message::Palette(true))].spacing(8).height(Length::Fill).align_y(Alignment::Center);
+        
+        // The compile status sits in front of the command box, in a slot of fixed width so a new
+        // compile time or a different diagnostic count cannot move the controls around it.
+        let mut right = row![].spacing(8).align_y(Alignment::Center);
+        let doc = self.doc();
+        if let Some(doc) = doc {
+            let mut views = row![].align_y(Alignment::Center);
+            for view in [View::Source, View::Split, View::Preview] {
+                views = views.push(widgets::mode_tab(view.label(), self.settings.view == view, t, Message::ViewChanged(view)));
+            }
+            let divider = container(Space::new().width(Length::Fixed(1.0))).width(Length::Fixed(1.0)).height(Length::Fixed(22.0)).style(t.filled(t.divider));
             left = left.push(divider).push(views);
             let (label, color) = status_of(doc, self.fonts_pending, t);
-            right = right
-                .push(zoom)
-                .push(widgets::text_button(document::shorten(&label, 28), color, t, Message::TogglePanel(RightPanel::Problems)));
+            right = right.push(
+                container(widgets::text_button(document::shorten(&label, 22), color, t, Message::TogglePanel(RightPanel::Problems)))
+                    .width(Length::Fixed(STATUS_SLOT))
+                    .align_x(Alignment::End),
+            );
+        }
+        right = right.push(widgets::search_box("Find a command", 236.0, t, Message::Palette(true)));
+        if doc.is_some() {
+            let choices: Vec<ZoomStep> = ZOOM_STEPS.iter().map(|step| ZoomStep(*step)).collect();
+            let zoom = pick_list(choices, Some(ZoomStep(self.settings.zoom)), |step: ZoomStep| Message::ZoomStep(step))
+                .text_size(12.5)
+                .padding(Padding { top: 7.0, bottom: 7.0, left: 10.0, right: 8.0 })
+                .width(Length::Fixed(88.0))
+                .style(t.pick_list());
+            right = right.push(zoom);
         }
         let bar = row![left, Space::new().width(Length::Fill), right].align_y(Alignment::Center);
 
@@ -1611,7 +1623,6 @@ impl App {
         let width = self.source_width();
         let show_mode = width > 360.0;
         let show_message = width > 520.0;
-        let show_status = width > 430.0;
         let mut head = row![].spacing(8).align_y(Alignment::Center);
         head = head.push(text(document::shorten(&doc.name(), if show_mode { 32 } else { 16 })).font(theme::medium()).size(12.5).color(t.text));
         if doc.dirty() {
@@ -1656,10 +1667,6 @@ impl App {
                     ..button::Style::default()
                 }),
         );
-        if show_status {
-            let (label, color) = status_of(doc, self.fonts_pending, t);
-            head = head.push(text(document::shorten(&label, 20)).size(11.5).color(color).wrapping(iced::widget::text::Wrapping::None));
-        }
 
         // The same header height and a separate 1 px rule, exactly like the side panels, so
         // both rules land on the same row.

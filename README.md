@@ -7,7 +7,7 @@ it, and **Export PDF** writes exactly the pages on screen.
 
 ```
 ┌ tab strip ── ⌂ · document tabs · + New ──────────────────── theme · help · info ┐
-├ mode bar ── Menu │ Source · Split · Preview ── compile status · palette · zoom  │
+├ mode bar ── Menu │ Source · Split · Preview ── compile · palette · zoom ────────┤
 │ ┌──┐┌─ source ─────────────────┐┌── page view (typst) ──┐┌─ panel ────────────┐ │
 │ │  ││ 1  #set page(...)        ││                        ││ Problems / Document│ │
 │ │▐▌││ 2  #set text(...)        ││   ┌──────────────┐     ││      / Log         │ │
@@ -224,9 +224,10 @@ it. The typeset pages are identical in both, because they come from the same com
 
 The tab strip holds one tab per document and the **New** action; the mode bar has the
 **Menu**, the view tabs (*Source · Split · Preview*), the compile status (click it for
-*Problems*), the command palette and the zoom control. The left rail has save, export,
-compile, pan and the zoom tools, with the page box, page count and page buttons at the
-bottom. The right rail toggles the panels and holds the theme and help buttons.
+*Problems*) in front of the command palette, and the zoom control. The compile time changes on
+every compile, so it sits in a fixed-width slot and never shifts its neighbours. The left rail
+has save, export, compile, pan and the zoom tools, with the page box, page count and page
+buttons at the bottom. The right rail toggles the panels and holds the theme and help buttons.
 
 | Keys | |
 | --- | --- |
