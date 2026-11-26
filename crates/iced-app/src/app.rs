@@ -466,13 +466,18 @@ impl App {
         match std::fs::write(&path, doc.text().as_bytes()) {
             Ok(()) => {
                 doc.saved = Some(doc.text());
+                // `:w` left a "writing…" note; the toast below is the outcome, so retire it.
+                doc.vim.clear_message();
                 let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
                 self.toast(format!("Saved {name}"));
                 // A renamed document needs a fresh compile: its folder (and so its includes) may
                 // have changed.
                 self.recompile(id);
             }
-            Err(error) => self.error = Some(format!("cannot write {}: {error}", path.display())),
+            Err(error) => {
+                doc.vim.clear_message();
+                self.error = Some(format!("cannot write {}: {error}", path.display()));
+            }
         }
     }
 
@@ -1214,6 +1219,16 @@ impl App {
             VimRequest::Save => {
                 if let Some(id) = self.active {
                     self.save(id, false);
+                }
+            }
+            VimRequest::SaveAndClose => {
+                if let Some(id) = self.active {
+                    self.save(id, false);
+                    // Only close once the write went through: `save` reports its own failure and
+                    // leaves the tab dirty, and `request_close` then asks about it.
+                    if self.docs.iter().find(|doc| doc.id == id).is_some_and(|doc| !doc.dirty()) {
+                        self.request_close(id);
+                    }
                 }
             }
             VimRequest::Close => {

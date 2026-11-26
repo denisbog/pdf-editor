@@ -168,6 +168,11 @@ impl VimEditor {
         &self.vim.message
     }
 
+    /// Retire a note the last command left, once the write it asked for has run.
+    pub fn clear_message(&mut self) {
+        self.vim.clear_message();
+    }
+
     pub fn take_request(&mut self) -> Option<vim::Request> {
         self.vim.request.take()
     }

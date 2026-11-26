@@ -42,6 +42,8 @@ const GRIP: f32 = 3.0;
 /// A document command raised inside a pass, when `self.docs` is out of the window.
 enum PendingAction {
     Save(u64),
+    /// Write and then close, for vim's `:wq` and `:x`.
+    SaveAndClose(u64),
     Export(u64),
     Compile(u64),
     Close(u64),
@@ -421,13 +423,18 @@ impl App {
         match std::fs::write(&path, doc.editor.text.as_bytes()) {
             Ok(()) => {
                 doc.saved = Some(doc.editor.text.clone());
+                // `:w` left a "writing…" note; the toast below is the outcome, so retire it.
+                doc.editor.vim.clear_message();
                 let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
                 self.toast(format!("Saved {name}"));
                 // A renamed document needs a fresh compile: its folder (and so its includes) may
                 // have changed.
                 self.recompile(id, ctx);
             }
-            Err(error) => self.error = Some(format!("cannot write {}: {error}", path.display())),
+            Err(error) => {
+                doc.editor.vim.clear_message();
+                self.error = Some(format!("cannot write {}: {error}", path.display()));
+            }
         }
     }
 
@@ -973,6 +980,7 @@ impl App {
                         // waits until the pass is over.
                         self.pending_actions.push(match request {
                             pdf_editor_core::vim::Request::Save => PendingAction::Save(doc.id),
+                            vim::Request::SaveAndClose => PendingAction::SaveAndClose(doc.id),
                             vim::Request::Close => PendingAction::Close(doc.id),
                             vim::Request::Open(path) => PendingAction::Open(PathBuf::from(path)),
                             vim::Request::Compile => PendingAction::Compile(doc.id),
@@ -1640,6 +1648,14 @@ impl eframe::App for App {
         for action in std::mem::take(&mut self.pending_actions) {
             match action {
                 PendingAction::Save(id) => self.save(id, false, &ctx),
+                PendingAction::SaveAndClose(id) => {
+                    self.save(id, false, &ctx);
+                    // Only close once the write went through: a failed save leaves the tab dirty
+                    // and `request_close` asks about it instead.
+                    if self.docs.iter().find(|doc| doc.id == id).is_some_and(|doc| !doc.dirty()) {
+                        self.request_close(id);
+                    }
+                }
                 PendingAction::Export(id) => self.export(id),
                 PendingAction::Compile(id) => self.recompile(id, &ctx),
                 PendingAction::Close(id) => self.request_close(id),

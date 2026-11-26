@@ -99,13 +99,17 @@ and `Esc` to come back. The mode and any half-typed command are shown next to th
 | Shortcuts | `x X s S D C Y r ~ J`; `p`/`P` with the unnamed register |
 | Visual | `d c y x s ~ > < J p` on the selection, `o` to swap ends, `v`/`V` to toggle |
 | Search | `/pattern` then `n` / `N` (wraps around) |
-| Command line | `:w` write, `:q` / `:q!` close the tab, `:e <file>` open, `:comp` compile, `:<n>` go to line |
+| Command line | `:w` write, `:wq` / `:x` write and close, `:q` / `:q!` close the tab, `:e <file>` open, `:comp` compile, `:<n>` go to line |
 | Undo | `u` and `Ctrl+R`; one insert session (or one change + its typing) is one step |
 
 Deliberately not implemented, and warned about on the status line when pressed: marks
 (`m`, `'`), macros (`q`), block Visual (`Ctrl+V`), `.` repeat, named registers, `zz`/`zt`/`zb`
 and folding. `Ctrl+D`/`Ctrl+U`/`Ctrl+F`/`Ctrl+B` move the cursor by lines (the view follows)
 rather than scrolling under a still cursor.
+
+A note in the header describes the command that just ran and is retired by the next key press,
+the way Vim's status line clears itself; a `:w` also drops its *writing…* note as soon as the
+file is on disk, where the toast reports the result.
 
 The bindings can be switched off from **Menu ▸ Vim bindings** or the command palette
 (*Vim bindings: on/off*); the choice is remembered. With them off the pane is an ordinary text

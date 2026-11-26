@@ -118,6 +118,8 @@ impl Mode {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     Save,
+    /// Write and then close the tab, as `:wq` and `:x` do in Vim.
+    SaveAndClose,
     Close,
     Open(String),
     Compile,
@@ -282,7 +284,14 @@ impl Vim {
         }
     }
 
+    /// Retire the note the last command left. The front-end calls this once the action it asked
+    /// for has actually run, so "writing…" cannot outlive the write.
+    pub fn clear_message(&mut self) {
+        self.message.clear();
+    }
+
     /// The mode indicator, with any count or operator being typed.
+
     pub fn status(&self) -> String {
         let mut status = self.mode.label().to_string();
         if self.mode == Mode::Insert || self.mode == Mode::Command {
@@ -344,6 +353,9 @@ impl Vim {
     pub fn press(&mut self, text: &mut String, key: Key, shift: bool, ctrl: bool) -> bool {
         self.changed = false;
         self.moved = false;
+        // A note describes the command that just ran, so the next press retires it: Vim's status
+        // line empties itself the same way when you start the next command.
+        self.message.clear();
         if self.mode == Mode::Insert {
             if key == Key::Escape || (ctrl && key == Key::OpenBracket) {
                 self.leave_insert(text);
@@ -1121,8 +1133,8 @@ impl Vim {
                 self.message = "writing…".to_string();
             }
             "wq" | "x" => {
-                self.request = Some(Request::Save);
-                self.message = "writing… (:q closes the tab)".to_string();
+                self.request = Some(Request::SaveAndClose);
+                self.message = "writing…".to_string();
             }
             "q" | "q!" => self.request = Some(Request::Close),
             "e" | "e!" => {
@@ -2015,12 +2027,31 @@ mod tests {
         let mut text = "= Title\n".to_string();
         press_keys(&mut vim, &mut text, &[Key::Colon]);
         assert_eq!(vim.prompt(), Some((':'.into(), "")));
-        for value in ["w", "q"] {
-            vim.type_text(value);
-        }
+        vim.type_text("w");
         press_keys(&mut vim, &mut text, &[Key::Enter]);
         assert_eq!(vim.request, Some(Request::Save));
         assert_eq!(vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn wq_asks_for_a_write_and_a_close() {
+        let mut vim = Vim::new();
+        let mut text = "= Title\n".to_string();
+        press_keys(&mut vim, &mut text, &[Key::Colon]);
+        vim.type_text("wq");
+        press_keys(&mut vim, &mut text, &[Key::Enter]);
+        assert_eq!(vim.request, Some(Request::SaveAndClose));
+    }
+
+    #[test]
+    fn a_note_lasts_until_the_next_key() {
+        let mut vim = Vim::new();
+        let mut text = "a\nb\n".to_string();
+        // `P` with nothing yanked leaves a note, and the next press retires it.
+        press_keys(&mut vim, &mut text, &[Key::P]);
+        assert!(!vim.message.is_empty(), "an empty register is worth a note");
+        press_keys(&mut vim, &mut text, &[Key::G]);
+        assert!(vim.message.is_empty(), "the next key clears the note");
     }
 
     #[test]
