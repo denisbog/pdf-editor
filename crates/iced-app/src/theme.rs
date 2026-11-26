@@ -217,7 +217,7 @@ impl Tokens {
 // ---------------------------------------------------------------------- metrics
 
 /// Chrome heights and widths, defined once: the page-view geometry and the bars both need them.
-pub const TAB_STRIP_HEIGHT: f32 = 38.0;
+pub const TAB_STRIP_HEIGHT: f32 = TAB_HEIGHT;
 pub const MODE_BAR_HEIGHT: f32 = 48.0;
 pub const PANEL_HEADER_HEIGHT: f32 = 40.0;
 /// A document tab's pill height inside the strip.
